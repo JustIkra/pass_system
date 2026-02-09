@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data files (large)
+Исходные данные АИС/
+data/
+*.csv
+
+# Trained models (generated)
+models/*.pkl
+models/*.json
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Docker volumes
+pgdata/
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code
+.claude/
