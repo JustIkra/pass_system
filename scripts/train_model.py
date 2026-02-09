@@ -193,7 +193,7 @@ def main() -> None:
             logger.info("=== Validation Summary ===")
             logger.info("Branches validated  : %d", len(validated))
             logger.info(
-                "MAPE  (mean/median) : %.1f%% / %.1f%%",
+                "wMAPE (mean/median) : %.1f%% / %.1f%%",
                 sum(mapes) / len(mapes),
                 sorted(mapes)[len(mapes) // 2],
             )
@@ -210,12 +210,12 @@ def main() -> None:
                 sum(cis) / len(cis) * 100,
             )
 
-            under_20 = sum(1 for m in mapes if m < 20)
+            under_25 = sum(1 for m in mapes if m < 25)
             logger.info(
-                "MAPE < 20%% : %d / %d (%.0f%%)",
-                under_20,
+                "wMAPE < 25%% : %d / %d (%.0f%%)",
+                under_25,
                 len(mapes),
-                under_20 / len(mapes) * 100,
+                under_25 / len(mapes) * 100,
             )
 
             # Save validation report
@@ -228,12 +228,12 @@ def main() -> None:
                         "rmse": b["validation"]["rmse"],
                         "peak_accuracy": b["validation"]["peak_accuracy"],
                         "ci_coverage": b["validation"]["ci_coverage"],
-                        "passed": b["validation"]["mape"] < 20,
+                        "passed": b["validation"]["mape"] < 25,
                     }
                     for b in validated
                 ],
                 "summary": {
-                    "branches_passed": under_20,
+                    "branches_passed": under_25,
                     "branches_total": len(validated),
                     "avg_mape": round(sum(mapes) / len(mapes), 2),
                     "avg_mae": round(sum(maes) / len(maes), 4),

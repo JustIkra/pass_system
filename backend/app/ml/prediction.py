@@ -25,7 +25,7 @@ from prophet import Prophet
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.ml.utils import add_regressors, is_russian_holiday
+from app.ml.utils import REGRESSOR_COLUMNS, add_regressors, is_russian_holiday
 
 logger = logging.getLogger(__name__)
 
@@ -176,14 +176,14 @@ def generate_forecast(
         logger.warning("Empty future for %d-%02d (no working hours?)", year, month)
         return []
 
-    # Predict visits
+    # Predict visits (model was trained on log1p-transformed data)
     visits_fc = visits_model.predict(
-        future[["ds", "is_month_start", "is_month_end", "is_monday"]]
+        future[["ds"] + REGRESSOR_COLUMNS]
     )
 
-    # Predict wait
+    # Predict wait (also log1p-transformed)
     wait_fc = wait_model.predict(
-        future[["ds", "is_month_start", "is_month_end", "is_monday"]]
+        future[["ds"] + REGRESSOR_COLUMNS]
     )
 
     points: list[ForecastPoint] = []
@@ -192,10 +192,11 @@ def generate_forecast(
         row_w = wait_fc.iloc[i]
         ds: pd.Timestamp = row_v["ds"]
 
-        predicted_visits = max(0.0, round(float(row_v["yhat"]), 1))
-        predicted_avg_wait = max(0.0, round(float(row_w["yhat"]), 1))
-        confidence_lower = max(0.0, round(float(row_v["yhat_lower"]), 1))
-        confidence_upper = max(0.0, round(float(row_v["yhat_upper"]), 1))
+        # Inverse log1p transform (models trained on log-scale)
+        predicted_visits = max(0.0, round(float(np.expm1(row_v["yhat"])), 1))
+        predicted_avg_wait = max(0.0, round(float(np.expm1(row_w["yhat"])), 1))
+        confidence_lower = max(0.0, round(float(np.expm1(row_v["yhat_lower"])), 1))
+        confidence_upper = max(0.0, round(float(np.expm1(row_v["yhat_upper"])), 1))
 
         points.append(
             ForecastPoint(

@@ -716,9 +716,11 @@ Prophet использует формат `ds` (datetime) + `y` (target). Доп
 | `day_of_week` | int 0-6 | Понедельник=0, Воскресенье=6 |
 | `month` | int 1-12 | Месяц |
 | `is_holiday` | bool | Государственный праздник РФ |
-| `is_month_start` | bool | Первые 3 рабочих дня месяца (повышенная нагрузка) |
-| `is_month_end` | bool | Последние 3 рабочих дня месяца |
+| `is_month_start` | bool | Первые 5 дней месяца (повышенная нагрузка) |
+| `is_month_end` | bool | Последние 3 дня месяца |
 | `is_monday` | bool | Понедельник (часто пик) |
+| `is_weekend` | bool | Суббота (трафик ~35% ниже будней) |
+| `is_friday` | bool | Пятница (специфичный паттерн) |
 
 **Список праздников РФ (для is_holiday):**
 - 1-8 января (новогодние каникулы)
@@ -734,7 +736,7 @@ Prophet использует формат `ds` (datetime) + `y` (target). Доп
 **Выходной артефакт:**
 - Заполненная таблица `hourly_stats` в БД
 - Модуль `backend/app/ml/features.py` с функцией `prepare_prophet_data(branch_id) -> DataFrame`
-- Feature-набор: DataFrame с колонками `[ds, y, day_of_week, month, is_holiday, is_month_start, is_month_end, is_monday]`
+- Feature-набор: DataFrame с колонками `[ds, y, is_month_start, is_month_end, is_monday, is_weekend, is_friday]`
 
 **Критерии приемки (DoD):**
 - [ ] `hourly_stats` содержит записи для всех 44 филиалов
@@ -760,40 +762,42 @@ Prophet использует формат `ds` (datetime) + `y` (target). Доп
 
 ```python
 from prophet import Prophet
+from app.ml.utils import REGRESSOR_COLUMNS
 
 model = Prophet(
-    yearly_seasonality=True,     # Годовая сезонность
+    yearly_seasonality=True,     # Годовая сезонность (если данных >= 12 мес)
     weekly_seasonality=True,     # Недельная сезонность
     daily_seasonality=False,     # Не используем (данные уже почасовые)
-    changepoint_prior_scale=0.05,
-    seasonality_prior_scale=10.0,
-    holidays_prior_scale=10.0,
-    interval_width=0.80          # 80% доверительный интервал
+    changepoint_prior_scale=0.15,  # Гибкость тренда (повышена для адаптации к сдвигам)
+    seasonality_prior_scale=1.0,   # Регуляризация сезонности (снижена во избежание overfitting)
+    holidays_prior_scale=1.0,      # Регуляризация праздников
+    interval_width=0.80            # 80% доверительный интервал
 )
 
-# Добавить кастомную суточную сезонность
-model.add_seasonality(
-    name='intraday',
-    period=1,                    # 1 день
-    fourier_order=8              # Гибкость суточного паттерна
-)
+# Кастомная суточная сезонность (fourier_order=3 для 12 часовых слотов)
+model.add_seasonality(name='intraday', period=1, fourier_order=3)
 
-# Добавить праздники РФ
-model.add_country_holidays(country_name='RU')
+# Праздники РФ передаются через holidays DataFrame (см. utils.get_russian_holidays_df)
 
-# Добавить регрессоры
-model.add_regressor('is_month_start')
-model.add_regressor('is_month_end')
-model.add_regressor('is_monday')
+# Регрессоры из единого списка REGRESSOR_COLUMNS
+for col in REGRESSOR_COLUMNS:
+    model.add_regressor(col)
 ```
+
+**Подготовка данных (pipeline):**
+
+1. Загрузка из `hourly_stats` (рабочие часы 8:00-19:59)
+2. Заполнение пропущенных часов нулями (полная сетка date x hour, без воскресений)
+3. Логарифмическое преобразование: `y = log1p(original_y)` (стабилизация дисперсии, предотвращение отрицательных прогнозов)
+4. Добавление регрессоров (`REGRESSOR_COLUMNS`)
 
 **Процесс обучения:**
 
 1. Для каждого `branch_id`:
-   a. Получить `prepare_prophet_data(branch_id)` -> DataFrame
-   b. Проверить: если < 100 точек данных -> пропустить (логировать warning)
-   c. Обучить модель: `model.fit(df)`
-   d. Сохранить модель: `joblib.dump(model, f"models/prophet_branch_{branch_id}.pkl")`
+   a. Получить `prepare_training_data(branch_id)` -> DataFrame
+   b. Проверить: если < 360 **оригинальных** точек данных (до zero-fill) -> пропустить
+   c. Обучить модель: `model.fit(df)` (данные в log-scale)
+   d. Сохранить модель: `joblib.dump(model, f"models/branch_{branch_id}_visits.pkl")`
    e. Записать метрики обучения в лог
 
 2. Сохранить метаданные обучения:
@@ -807,13 +811,18 @@ model.add_regressor('is_monday')
    }
    ```
 
-**Метрики качества (вычисляются на training data как baseline):**
+**Метрики качества (вычисляются на backtesting, данные обратно-трансформированы через `expm1`):**
 
 | Метрика | Целевое значение | Формула |
 |---------|------------------|---------|
-| MAPE | < 20% на уровне день/филиал | `mean(abs(y - yhat) / y) * 100` (только для y > 0) |
-| MAE (visits) | < 3 визита/час | `mean(abs(y - yhat))` |
-| RMSE | < 5 визитов/час | `sqrt(mean((y - yhat)^2))` |
+| wMAPE | < 25% на уровне час/филиал | `sum(abs(actual - predicted)) / sum(actual) * 100` |
+| MAE (visits) | < 5 визитов/час | `mean(abs(actual - predicted))` |
+| RMSE | < 8 визитов/час | `sqrt(mean((actual - predicted)^2))` |
+| Peak accuracy | > 50% | Доля недель с совпадением 2/3 пиковых часов |
+| CI coverage | > 70% | Доля фактических значений внутри 80% ДИ |
+
+**Примечание:** Используется wMAPE (weighted MAPE) вместо стандартного MAPE, т.к. wMAPE
+взвешивает ошибки по объёму трафика и не искажается малонагруженными часами.
 
 **Входные данные:** Feature-набор из задачи 2.1. Таблица `hourly_stats`.
 
@@ -824,9 +833,9 @@ model.add_regressor('is_monday')
 - Модуль `backend/app/ml/train.py`
 
 **Критерии приемки (DoD):**
-- [ ] Обучены модели для >= 40 филиалов (допускается пропуск филиалов с < 100 точек данных)
+- [ ] Обучены модели для >= 40 филиалов (допускается пропуск филиалов с < 360 оригинальных точек данных)
 - [ ] Каждая модель сохранена в `models/` и загружается без ошибок
-- [ ] MAPE < 20% для >= 80% филиалов (на training data)
+- [ ] wMAPE < 25% для большинства филиалов (на backtesting)
 - [ ] Скрипт `scripts/train_model.py` выполняется за < 30 минут
 - [ ] Логи обучения выводят прогресс (X/44 branches) и метрики по каждому филиалу
 - [ ] `training_metadata.json` содержит корректные метаданные

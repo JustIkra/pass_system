@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.ml.gpu_utils import configure_cmdstanpy_gpu, detect_gpu
 from app.ml.utils import (
+    REGRESSOR_COLUMNS,
     add_regressors,
     calculate_ci_coverage,
     calculate_mae,
@@ -120,8 +121,34 @@ def prepare_training_data(
     # Fill NaN targets with 0
     df["y"] = df["y"].fillna(0.0)
 
+    # Track original (non-zero-filled) row count for MIN_DATA_POINTS checks
+    original_count = len(df)
+
+    # ---- Fill missing hourly slots with 0 ----
+    # Branches may have gaps (closed early, no visitors). Prophet needs
+    # a complete grid to avoid incorrect interpolation.
+    all_dates = pd.date_range(df["ds"].dt.normalize().min(),
+                              df["ds"].dt.normalize().max(), freq="D")
+    # Skip Sundays (weekday=6) — MFC is closed
+    all_dates = all_dates[all_dates.dayofweek != 6]
+    full_index = pd.DatetimeIndex([
+        d + pd.Timedelta(hours=h)
+        for d in all_dates
+        for h in WORKING_HOURS
+    ])
+    full_df = pd.DataFrame({"ds": full_index})
+    df = full_df.merge(df, on="ds", how="left")
+    df["y"] = df["y"].fillna(0.0)
+
+    # ---- Log transform ----
+    # Stabilises variance, prevents negative predictions, suits count data.
+    df["y"] = np.log1p(df["y"])
+
     # Add regressors
     df = add_regressors(df)
+
+    # Store original count so callers can check data sufficiency
+    df.attrs["original_count"] = original_count
 
     return df
 
@@ -163,9 +190,9 @@ def _build_prophet(
         yearly_seasonality=yearly,
         weekly_seasonality=True,
         daily_seasonality=False,
-        changepoint_prior_scale=0.05,
-        seasonality_prior_scale=10.0,
-        holidays_prior_scale=10.0,
+        changepoint_prior_scale=0.15,
+        seasonality_prior_scale=1.0,
+        holidays_prior_scale=1.0,
         interval_width=0.80,
     )
 
@@ -178,12 +205,11 @@ def _build_prophet(
     model = Prophet(**kwargs)
 
     # Custom intraday seasonality (period = 1 day)
-    model.add_seasonality(name="intraday", period=1, fourier_order=8)
+    model.add_seasonality(name="intraday", period=1, fourier_order=3)
 
     # Regressors
-    model.add_regressor("is_month_start")
-    model.add_regressor("is_month_end")
-    model.add_regressor("is_monday")
+    for col in REGRESSOR_COLUMNS:
+        model.add_regressor(col)
 
     return model
 
@@ -223,7 +249,7 @@ def train_branch_model(
                 branch_id, len(df), " [GPU]" if use_gpu else "")
 
     visits_model = _build_prophet(df, holidays_df, use_gpu=use_gpu)
-    visits_model.fit(df[["ds", "y", "is_month_start", "is_month_end", "is_monday"]])
+    visits_model.fit(df[["ds", "y"] + REGRESSOR_COLUMNS])
 
     # --- Wait model ---
     # If df has y_wait column, use it.  Otherwise build a trivial model from
@@ -231,11 +257,11 @@ def train_branch_model(
     wait_model = _build_prophet(df, holidays_df, use_gpu=use_gpu)
 
     if "y_wait" in df.columns:
-        wait_df = df[["ds", "is_month_start", "is_month_end", "is_monday"]].copy()
+        wait_df = df[["ds"] + REGRESSOR_COLUMNS].copy()
         wait_df["y"] = df["y_wait"]
     else:
         # Caller should supply a wait df; as fallback train on zeros
-        wait_df = df[["ds", "y", "is_month_start", "is_month_end", "is_monday"]].copy()
+        wait_df = df[["ds", "y"] + REGRESSOR_COLUMNS].copy()
         wait_df["y"] = 0.0
 
     wait_model.fit(wait_df)
@@ -384,13 +410,17 @@ def train_all_models(
         logger.info("[%d/%d] Fetching data for branch %d", idx, len(branch_ids), bid)
 
         df_visits = prepare_training_data(db_session, bid, target="total_visits")
-        if df_visits.empty or len(df_visits) < MIN_DATA_POINTS:
-            msg = f"Branch {bid}: insufficient data ({len(df_visits)} rows, need {MIN_DATA_POINTS})"
+        # Use original (pre-zero-fill) count for data sufficiency check
+        original_count = df_visits.attrs.get("original_count", len(df_visits))
+        if df_visits.empty or original_count < MIN_DATA_POINTS:
+            msg = f"Branch {bid}: insufficient data ({original_count} rows, need {MIN_DATA_POINTS})"
             logger.warning(msg)
             report["branches_skipped"].append({"branch_id": bid, "reason": msg})
             continue
 
         # Prepare wait data and attach as y_wait
+        # NOTE: prepare_training_data already applies log1p, so y_wait is
+        # already log-transformed when it comes from that function.
         df_wait = prepare_training_data(db_session, bid, target="avg_wait_minutes")
         if not df_wait.empty and len(df_wait) == len(df_visits):
             df_visits["y_wait"] = df_wait["y"].values
@@ -436,7 +466,7 @@ def train_all_models(
             if "validation" in branch_report:
                 m = branch_report["validation"]
                 logger.info(
-                    "  Branch %d: MAPE=%.1f%%, MAE=%.2f, Peak=%.1f%%, CI=%.1f%%",
+                    "  Branch %d: wMAPE=%.1f%%, MAE=%.2f, Peak=%.1f%%, CI=%.1f%%",
                     bid, m.get("mape", 0), m.get("mae", 0),
                     m.get("peak_accuracy", 0) * 100, m.get("ci_coverage", 0) * 100,
                 )
@@ -464,7 +494,7 @@ def train_all_models(
                     if "validation" in branch_report:
                         m = branch_report["validation"]
                         logger.info(
-                            "  Branch %d: MAPE=%.1f%%, MAE=%.2f (%.1fs)",
+                            "  Branch %d: wMAPE=%.1f%%, MAE=%.2f (%.1fs)",
                             bid, m.get("mape", 0), m.get("mae", 0),
                             branch_report["training_seconds"],
                         )
@@ -527,11 +557,12 @@ def validate_model(model: Prophet, df_test: pd.DataFrame) -> dict[str, Any]:
     dict
         Keys: ``mape``, ``mae``, ``rmse``, ``peak_accuracy``, ``ci_coverage``.
     """
-    future = df_test[["ds", "is_month_start", "is_month_end", "is_monday"]].copy()
+    future = df_test[["ds"] + REGRESSOR_COLUMNS].copy()
     forecast = model.predict(future)
 
-    actual = df_test["y"].values
-    predicted = forecast["yhat"].values
+    # Inverse log1p transform to get back to original scale
+    actual = np.maximum(np.expm1(df_test["y"].values), 0.0)
+    predicted = np.maximum(np.expm1(forecast["yhat"].values), 0.0)
 
     mape = calculate_mape(actual, predicted)
     mae = calculate_mae(actual, predicted)
@@ -541,8 +572,10 @@ def validate_model(model: Prophet, df_test: pd.DataFrame) -> dict[str, Any]:
     pred_df = forecast[["ds", "yhat"]].copy()
     peak_acc = calculate_peak_accuracy(df_test, pred_df, top_n=3)
 
-    # CI coverage
-    ci = calculate_ci_coverage(actual, forecast["yhat_lower"].values, forecast["yhat_upper"].values)
+    # CI coverage (inverse-transform bounds too)
+    ci_lower = np.maximum(np.expm1(forecast["yhat_lower"].values), 0.0)
+    ci_upper = np.maximum(np.expm1(forecast["yhat_upper"].values), 0.0)
+    ci = calculate_ci_coverage(actual, ci_lower, ci_upper)
 
     return {
         "mape": round(mape, 2),

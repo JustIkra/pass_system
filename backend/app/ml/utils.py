@@ -83,6 +83,15 @@ def is_russian_holiday(d: date) -> bool:
 # Regressors
 # ---------------------------------------------------------------------------
 
+REGRESSOR_COLUMNS: list[str] = [
+    "is_month_start",
+    "is_month_end",
+    "is_monday",
+    "is_weekend",
+    "is_friday",
+]
+
+
 def add_regressors(df: pd.DataFrame) -> pd.DataFrame:
     """Add regressor columns to a DataFrame that already has a ``ds`` column.
 
@@ -90,6 +99,8 @@ def add_regressors(df: pd.DataFrame) -> pd.DataFrame:
     * ``is_month_start`` -- 1 if day of month is in [1, 5], else 0
     * ``is_month_end``   -- 1 if day is within last 3 days of its month, else 0
     * ``is_monday``      -- 1 if Monday, else 0
+    * ``is_weekend``     -- 1 if Saturday (weekday=5), else 0
+    * ``is_friday``      -- 1 if Friday (weekday=4), else 0
     """
     df = df.copy()
     ds = pd.to_datetime(df["ds"])
@@ -102,6 +113,8 @@ def add_regressors(df: pd.DataFrame) -> pd.DataFrame:
     df["is_month_end"] = ((last_day_of_month - ds.dt.day) < 3).astype(int)
 
     df["is_monday"] = (ds.dt.dayofweek == 0).astype(int)
+    df["is_weekend"] = (ds.dt.dayofweek == 5).astype(int)
+    df["is_friday"] = (ds.dt.dayofweek == 4).astype(int)
 
     return df
 
@@ -111,16 +124,21 @@ def add_regressors(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def calculate_mape(actual: np.ndarray | pd.Series, predicted: np.ndarray | pd.Series) -> float:
-    """Mean Absolute Percentage Error (only where actual > 0).
+    """Weighted Mean Absolute Percentage Error (wMAPE).
+
+    wMAPE = sum(|actual - predicted|) / sum(actual) * 100
+
+    More robust than standard MAPE: weights errors by traffic volume,
+    so low-visit hours don't dominate the metric.
 
     Returns percentage value (e.g. 15.3 means 15.3 %).
     """
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
-    mask = actual > 0
-    if mask.sum() == 0:
+    total = np.sum(actual)
+    if total == 0:
         return 0.0
-    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100)
+    return float(np.sum(np.abs(actual - predicted)) / total * 100)
 
 
 def calculate_mae(actual: np.ndarray | pd.Series, predicted: np.ndarray | pd.Series) -> float:

@@ -72,8 +72,9 @@ CSV files (1.7GB) → scripts/init_db.py → PostgreSQL (mfc_db)
 - **api/** — 4 route modules: branches, forecast (windows/staffing/history), analytics (compare/overview), data (upload/retrain)
 - **services/etl.py** — CSV parsing (delimiter `;`, dates DD.MM.YYYY, times HH:MM:SS), batch loading, hourly_stats aggregation
 - **services/forecast_service.py** — Forecast queries, window load calculation, staffing recommendations
-- **ml/training.py** — Prophet model training with Russian holidays, intraday seasonality, backtesting validation
-- **ml/prediction.py** — Forecast generation, confidence intervals, DB persistence
+- **ml/utils.py** — REGRESSOR_COLUMNS, add_regressors(), wMAPE metric, Russian holidays
+- **ml/training.py** — Prophet model training: zero-fill gaps, log1p transform, backtesting with expm1 inverse
+- **ml/prediction.py** — Forecast generation with expm1 inverse transform, confidence intervals, DB persistence
 - **config.py** — Settings via env vars: DATABASE_URL, DATA_DIR, MODELS_DIR, CORS_ORIGINS
 
 ### Frontend (`frontend/src/`)
@@ -99,7 +100,11 @@ CSV files (1.7GB) → scripts/init_db.py → PostgreSQL (mfc_db)
 - **CSV format:** delimiter `;`, encoding UTF-8, dates DD.MM.YYYY, times HH:MM:SS, empty = NULL
 - **Backend field naming:** snake_case (`from_date`, `to_date`). Frontend types must match exactly
 - **Nullable fields:** BranchComparison fields (`predicted_avg_wait`, `predicted_avg_service`, `predicted_peak_hour`) can be null — use `| null` in TypeScript
-- **Prophet models:** Need minimum 30 days of hourly data per branch to train; skip branches with insufficient data
+- **Prophet models:** Need minimum 360 **original** data points per branch (before zero-fill); skip branches with insufficient data
+- **ML data pipeline:** `prepare_training_data` fills missing hourly slots with 0 (skipping Sundays), then applies `np.log1p(y)`. All models train on log-scale data.
+- **ML inverse transform:** Prediction/validation must apply `np.expm1()` + `np.maximum(..., 0.0)` to convert back from log-scale
+- **Regressor columns:** Defined once in `REGRESSOR_COLUMNS` (utils.py). Never hardcode `["is_month_start", ...]` — always use the constant
+- **Validation metric:** wMAPE (weighted MAPE), not standard MAPE. Formula: `sum(|actual-predicted|) / sum(actual) * 100`
 - **All UI text in Russian.** Numbers formatted with space separator (1 234), decimal comma (78,5%)
 
 ## Documentation
