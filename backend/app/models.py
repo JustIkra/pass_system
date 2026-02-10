@@ -32,6 +32,7 @@ class Branch(Base):
     employee_roles: Mapped[list["EmployeeRole"]] = relationship(back_populates="branch")
     hourly_stats: Mapped[list["HourlyStat"]] = relationship(back_populates="branch")
     forecasts: Mapped[list["Forecast"]] = relationship(back_populates="branch")
+    branch_metadata: Mapped["BranchMetadata | None"] = relationship(back_populates="branch", uselist=False)
 
 
 class Employee(Base):
@@ -162,3 +163,24 @@ class Forecast(Base):
     )
 
     branch: Mapped["Branch"] = relationship(back_populates="forecasts")
+
+
+class BranchMetadata(Base):
+    """Валидированные метаданные филиалов."""
+
+    __tablename__ = "branch_metadata"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    branch_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("branches.id"), nullable=False, unique=True
+    )
+    num_windows: Mapped[int] = mapped_column(Integer, nullable=False)
+    num_windows_source: Mapped[str] = mapped_column(String, nullable=False)  # hourly_stats | queue_records | manual
+    capacity_per_window: Mapped[int] = mapped_column(Integer, default=25)  # клиентов/окно/час
+    max_capacity: Mapped[int] = mapped_column(Integer, nullable=False)  # num_windows * capacity_per_window
+
+    validated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    confidence: Mapped[str] = mapped_column(String, nullable=False)  # high | medium | low
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    branch: Mapped["Branch"] = relationship(back_populates="branch_metadata")

@@ -2,8 +2,9 @@
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, distinct
-from app.models import Branch, HourlyStat, QueueRecord
+from app.models import Branch, HourlyStat, QueueRecord, BranchMetadata
 from typing import Dict, Optional, List
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -59,4 +60,72 @@ class BranchMetadataValidator:
             'avg_windows': float(hourly_stats.avg_windows),
             'data_points': int(hourly_stats.data_points),
             'source': 'hourly_stats'
+        }
+
+    def store_metadata(self, metadata: Dict) -> bool:
+        """
+        Сохраняет валидированные метаданные.
+
+        Args:
+            metadata: Dict с полями branch_id, num_windows, source, confidence
+
+        Returns:
+            True если успешно
+        """
+        try:
+            # Проверяем существует ли запись
+            existing = self.db.query(BranchMetadata).filter(
+                BranchMetadata.branch_id == metadata['branch_id']
+            ).first()
+
+            if existing:
+                # Обновляем
+                existing.num_windows = metadata['num_windows']
+                existing.num_windows_source = metadata['source']
+                existing.max_capacity = metadata['num_windows'] * 25
+                existing.validated_at = datetime.utcnow()
+                existing.confidence = metadata.get('confidence', 'medium')
+            else:
+                # Создаем новую запись
+                new_metadata = BranchMetadata(
+                    branch_id=metadata['branch_id'],
+                    num_windows=metadata['num_windows'],
+                    num_windows_source=metadata['source'],
+                    max_capacity=metadata['num_windows'] * 25,
+                    confidence=metadata.get('confidence', 'medium')
+                )
+                self.db.add(new_metadata)
+
+            self.db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error storing metadata for branch {metadata['branch_id']}: {e}")
+            self.db.rollback()
+            return False
+
+    def get_metadata(self, branch_id: int) -> Optional[Dict]:
+        """
+        Получает валидированные метаданные филиала.
+
+        Args:
+            branch_id: ID филиала
+
+        Returns:
+            Dict с метаданными или None
+        """
+        metadata = self.db.query(BranchMetadata).filter(
+            BranchMetadata.branch_id == branch_id
+        ).first()
+
+        if not metadata:
+            return None
+
+        return {
+            'branch_id': metadata.branch_id,
+            'num_windows': metadata.num_windows,
+            'source': metadata.num_windows_source,
+            'capacity_per_window': metadata.capacity_per_window,
+            'max_capacity': metadata.max_capacity,
+            'validated_at': metadata.validated_at.isoformat(),
+            'confidence': metadata.confidence
         }

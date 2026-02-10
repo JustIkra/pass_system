@@ -17,3 +17,26 @@ def test_extract_window_count_from_history():
     assert result['data_points'] > 100  # Достаточно данных
 
     db.close()
+
+
+def test_store_validated_metadata():
+    """Сохранение валидированных метаданных филиала."""
+    db = SessionLocal()
+    validator = BranchMetadataValidator(db)
+
+    metadata = {
+        'branch_id': 12,
+        'num_windows': 51,
+        'source': 'hourly_stats',
+        'validated_at': '2026-02-10',
+        'confidence': 'high'
+    }
+
+    result = validator.store_metadata(metadata)
+    assert result is True
+
+    # Проверяем что сохранилось
+    stored = validator.get_metadata(branch_id=12)
+    assert stored['num_windows'] == 51
+
+    db.close()
