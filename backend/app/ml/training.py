@@ -58,10 +58,67 @@ logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 # Data preparation
 # ---------------------------------------------------------------------------
 
+def detect_and_remove_outliers(
+    df: pd.DataFrame,
+    y_col: str = "y",
+    threshold: float = 3.0,
+) -> pd.DataFrame:
+    """Remove outliers from training data using Z-score method.
+
+    Outliers are data points with Z-score > threshold (default: 3σ).
+    This helps prevent Prophet from overfitting to rare extreme spikes.
+
+    Parameters
+    ----------
+    df:
+        Training DataFrame with a column named ``y_col``.
+    y_col:
+        Column name containing the target values (default: "y").
+    threshold:
+        Z-score threshold for outlier detection (default: 3.0 = 99.7% of normal data).
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame with outliers removed. Original index is preserved.
+    """
+    if df.empty or y_col not in df.columns:
+        return df
+
+    values = df[y_col].values
+    # Only compute stats on non-zero values (MFC data has many zeros for closed hours)
+    non_zero = values[values > 0]
+
+    if len(non_zero) < 10:
+        # Not enough data points for meaningful outlier detection
+        return df
+
+    mean = np.mean(non_zero)
+    std = np.std(non_zero)
+
+    if std == 0:
+        # All non-zero values are identical, no outliers
+        return df
+
+    # Compute Z-scores only for non-zero values
+    z_scores = np.abs((values - mean) / std)
+    mask = (values == 0) | (z_scores <= threshold)
+
+    removed_count = len(df) - mask.sum()
+    if removed_count > 0:
+        logger.debug(
+            "Removed %d outliers (%.1f%% of data, threshold=%.1fσ)",
+            removed_count, 100 * removed_count / len(df), threshold,
+        )
+
+    return df[mask].copy()
+
+
 def prepare_training_data(
     db_session: Session,
     branch_id: int,
     target: str = "total_visits",
+    clean_outliers: bool = True,
 ) -> pd.DataFrame:
     """Fetch ``hourly_stats`` for *branch_id* and reshape into Prophet format.
 
@@ -74,6 +131,8 @@ def prepare_training_data(
     target:
         Column from ``hourly_stats`` to use as ``y``.  Typically
         ``"total_visits"`` or ``"avg_wait_minutes"``.
+    clean_outliers:
+        If ``True`` (default), removes outliers using Z-score method (3σ threshold).
 
     Returns
     -------
@@ -123,6 +182,12 @@ def prepare_training_data(
 
     # Track original (non-zero-filled) row count for MIN_DATA_POINTS checks
     original_count = len(df)
+
+    # ---- Remove outliers if requested ----
+    # Must happen BEFORE zero-fill and log transform to avoid removing
+    # valid zero hours or distorting the distribution.
+    if clean_outliers:
+        df = detect_and_remove_outliers(df, y_col="y", threshold=3.0)
 
     # ---- Winsorize wait time outliers ----
     # Wait time data has extreme outliers (max ~467 min, P99 ~24 min).
@@ -378,6 +443,7 @@ def train_all_models(
     test_split_date: str | None = None,
     n_workers: int | None = None,
     use_gpu: bool = False,
+    clean_outliers: bool = True,
 ) -> dict[str, Any]:
     """Train Prophet models for all (or selected) branches and save to disk.
 
@@ -403,6 +469,9 @@ def train_all_models(
     use_gpu:
         If ``True``, configure CmdStanPy OpenCL backend for GPU-accelerated
         MCMC sampling in each worker process.
+    clean_outliers:
+        If ``True`` (default), removes outliers from training data using
+        Z-score method (3σ threshold).
 
     Returns
     -------
@@ -462,7 +531,9 @@ def train_all_models(
     for idx, bid in enumerate(branch_ids, 1):
         logger.info("[%d/%d] Fetching data for branch %d", idx, len(branch_ids), bid)
 
-        df_visits = prepare_training_data(db_session, bid, target="total_visits")
+        df_visits = prepare_training_data(
+            db_session, bid, target="total_visits", clean_outliers=clean_outliers
+        )
         # Use original (pre-zero-fill) count for data sufficiency check
         original_count = df_visits.attrs.get("original_count", len(df_visits))
         if df_visits.empty or original_count < MIN_DATA_POINTS:
@@ -474,7 +545,9 @@ def train_all_models(
         # Prepare wait data and attach as y_wait
         # NOTE: prepare_training_data already applies log1p, so y_wait is
         # already log-transformed when it comes from that function.
-        df_wait = prepare_training_data(db_session, bid, target="avg_wait_minutes")
+        df_wait = prepare_training_data(
+            db_session, bid, target="avg_wait_minutes", clean_outliers=clean_outliers
+        )
         wait_log_cap: float | None = df_wait.attrs.get("log_cap")
         if not df_wait.empty and len(df_wait) == len(df_visits):
             df_visits["y_wait"] = df_wait["y"].values
