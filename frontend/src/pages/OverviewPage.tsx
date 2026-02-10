@@ -35,7 +35,7 @@ export default function OverviewPage() {
     [dateRange.from, dateRange.to]
   );
 
-  if (loading) {
+  if (loading && !data) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="flex flex-col items-center gap-3">
@@ -230,12 +230,12 @@ function AllBranchesTable({
     let result = [...branches];
     if (search.trim()) {
       const q = search.toLowerCase();
-      result = result.filter((b) => b.name.toLowerCase().includes(q));
+      result = result.filter((b) => (b.name ?? '').toLowerCase().includes(q));
     }
     result.sort((a, b) => {
       let cmp = 0;
       if (sortField === 'name') {
-        cmp = a.name.localeCompare(b.name, 'ru');
+        cmp = (a.name ?? '').localeCompare(b.name ?? '', 'ru');
       } else {
         cmp = a.total_records - b.total_records;
       }

@@ -180,7 +180,7 @@ function ForecastTab({
   fromDate: string;
   toDate: string;
 }) {
-  if (loading) return <Spinner />;
+  if (loading && !forecast) return <Spinner />;
   if (error) return <ErrorBlock message={error} onRetry={refetch} />;
   if (!forecast || forecast.data.length === 0) {
     return (
@@ -280,7 +280,7 @@ function WindowsTab({
     [branchId, fromDate, toDate]
   );
 
-  if (loading) return <Spinner />;
+  if (loading && !data) return <Spinner />;
   if (error) return <ErrorBlock message={error} onRetry={refetch} />;
   if (!data || data.windows.length === 0) {
     return (
@@ -442,7 +442,7 @@ function StaffingTab({
     [branchId, fromDate, toDate]
   );
 
-  if (loading) return <Spinner />;
+  if (loading && !data) return <Spinner />;
   if (error) return <ErrorBlock message={error} onRetry={refetch} />;
   if (!data || data.recommendations.length === 0) {
     return (
