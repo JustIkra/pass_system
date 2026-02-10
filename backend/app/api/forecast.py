@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import calendar
 import re
-from datetime import date
+from datetime import date, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
@@ -34,6 +36,9 @@ from app.services.forecast_service import (
 router = APIRouter(prefix="/api/branches", tags=["forecast"])
 
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_DATE_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+_MAX_DATE_RANGE_DAYS = 60
 
 
 def _parse_month(month: str) -> tuple[int, int]:
@@ -45,6 +50,66 @@ def _parse_month(month: str) -> tuple[int, int]:
         )
     year, mon = month.split("-")
     return int(year), int(mon)
+
+
+def _parse_date(value: str, param_name: str) -> date:
+    """Validate and parse YYYY-MM-DD string into a date object."""
+    if not _DATE_RE.match(value):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {param_name} format: '{value}'. Expected YYYY-MM-DD.",
+        )
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {param_name} date: '{value}'.",
+        )
+
+
+def _resolve_date_range(
+    from_date: Optional[str],
+    to_date: Optional[str],
+    month: Optional[str],
+) -> tuple[date, date]:
+    """Resolve date range from query parameters.
+
+    Priority:
+    1. from_date / to_date  -- explicit date range
+    2. month                -- first/last day of the month
+    3. default              -- today + 30 days
+    """
+    if from_date is not None:
+        fd = _parse_date(from_date, "from_date")
+        if to_date is not None:
+            td = _parse_date(to_date, "to_date")
+        else:
+            # Default to_date: from_date + 30 days
+            td = fd + timedelta(days=30)
+        if td < fd:
+            raise HTTPException(
+                status_code=422,
+                detail="to_date must not be earlier than from_date.",
+            )
+        if (td - fd).days > _MAX_DATE_RANGE_DAYS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Date range must not exceed {_MAX_DATE_RANGE_DAYS} days.",
+            )
+        return fd, td
+
+    if month is not None:
+        year, mon = _parse_month(month)
+        fd = date(year, mon, 1)
+        last_day = calendar.monthrange(year, mon)[1]
+        td = date(year, mon, last_day)
+        return fd, td
+
+    # Default: today + 30 days
+    fd = date.today()
+    td = fd + timedelta(days=30)
+    return fd, td
 
 
 def _ensure_branch(db: Session, branch_id: int) -> Branch:
@@ -60,20 +125,23 @@ def _ensure_branch(db: Session, branch_id: int) -> Branch:
 @router.get("/{branch_id}/forecast", response_model=ForecastResponse)
 def get_forecast(
     branch_id: int,
-    month: str = Query(..., description="Month in YYYY-MM format"),
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Return forecast data for a branch for the given month."""
-    year, mon = _parse_month(month)
+    """Return forecast data for a branch for the given date range or month."""
+    fd, td = _resolve_date_range(from_date, to_date, month)
     branch = _ensure_branch(db, branch_id)
 
-    data = get_forecast_data(db, branch_id, year, mon)
+    data = get_forecast_data(db, branch_id, fd, td)
     summary = compute_forecast_summary(data)
 
     return {
         "branch_id": branch.id,
         "branch_name": branch.name,
-        "month": month,
+        "from_date": fd.isoformat(),
+        "to_date": td.isoformat(),
         "data": data,
         "summary": summary,
     }
@@ -85,18 +153,22 @@ def get_forecast(
 @router.get("/{branch_id}/windows", response_model=WindowsResponse)
 def get_windows(
     branch_id: int,
-    month: str = Query(..., description="Month in YYYY-MM format"),
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Return window load data for a branch."""
-    year, mon = _parse_month(month)
+    fd, td = _resolve_date_range(from_date, to_date, month)
     _ensure_branch(db, branch_id)
 
-    windows = get_window_stats(db, branch_id, year, mon)
+    windows, data_source = get_window_stats(db, branch_id, fd, td)
     return {
         "branch_id": branch_id,
-        "month": month,
+        "from_date": fd.isoformat(),
+        "to_date": td.isoformat(),
         "windows": windows,
+        "data_source": data_source,
     }
 
 
@@ -106,17 +178,20 @@ def get_windows(
 @router.get("/{branch_id}/staffing", response_model=StaffingResponse)
 def get_staffing(
     branch_id: int,
-    month: str = Query(..., description="Month in YYYY-MM format"),
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Return staffing recommendations for a branch."""
-    year, mon = _parse_month(month)
+    fd, td = _resolve_date_range(from_date, to_date, month)
     _ensure_branch(db, branch_id)
 
-    recommendations = get_staffing_recommendations(db, branch_id, year, mon)
+    recommendations = get_staffing_recommendations(db, branch_id, fd, td)
     return {
         "branch_id": branch_id,
-        "month": month,
+        "from_date": fd.isoformat(),
+        "to_date": td.isoformat(),
         "recommendations": recommendations,
     }
 
@@ -127,27 +202,35 @@ def get_staffing(
 @router.get("/{branch_id}/history", response_model=HistoryResponse)
 def get_history(
     branch_id: int,
-    from_month: str = Query(..., alias="from", description="Start month YYYY-MM"),
-    to_month: str = Query(..., alias="to", description="End month YYYY-MM"),
+    from_month: Optional[str] = Query(None, alias="from", description="Start month YYYY-MM (backward compat)"),
+    to_month: Optional[str] = Query(None, alias="to", description="End month YYYY-MM (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Return historical hourly_stats data for a branch over a date range."""
-    from_year, from_mon = _parse_month(from_month)
-    to_year, to_mon = _parse_month(to_month)
     _ensure_branch(db, branch_id)
 
-    start_date = date(from_year, from_mon, 1)
-    if to_mon == 12:
-        end_date = date(to_year + 1, 1, 1)
+    # Resolve date range: prefer from_date/to_date, then from/to months, then default
+    if from_date is not None:
+        fd, td = _resolve_date_range(from_date, to_date, None)
+    elif from_month is not None and to_month is not None:
+        from_year, from_mon = _parse_month(from_month)
+        to_year, to_mon = _parse_month(to_month)
+        fd = date(from_year, from_mon, 1)
+        last_day = calendar.monthrange(to_year, to_mon)[1]
+        td = date(to_year, to_mon, last_day)
     else:
-        end_date = date(to_year, to_mon + 1, 1)
+        # Default: last 30 days of history
+        td = date.today()
+        fd = td - timedelta(days=30)
 
     hourly_rows = (
         db.query(HourlyStat)
         .filter(
             HourlyStat.branch_id == branch_id,
-            HourlyStat.date >= start_date,
-            HourlyStat.date < end_date,
+            HourlyStat.date >= fd,
+            HourlyStat.date <= td,
         )
         .order_by(HourlyStat.date, HourlyStat.hour)
         .all()
@@ -220,7 +303,7 @@ def get_history(
 
     return {
         "branch_id": branch_id,
-        "period": {"from_date": from_month, "to_date": to_month},
+        "period": {"from_date": fd.isoformat(), "to_date": td.isoformat()},
         "daily": daily,
         "hourly": hourly,
     }

@@ -35,7 +35,7 @@ export default function HeatmapChart({ data, title }: HeatmapChartProps) {
 
   const formattedData = data.map((d) => [d.hour - 8, d.dayOfWeek, d.value]);
 
-  const option: echarts.EChartsOption = {
+  const option: echarts.EChartsCoreOption = {
     title: title
       ? {
           text: title,

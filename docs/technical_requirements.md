@@ -474,7 +474,9 @@ CREATE INDEX idx_employee_roles_branch_date ON employee_roles (branch_id, starte
 ```
 
 ##### 4. `GET /api/branches/{id}/windows?month=2026-03`
-**Описание:** Прогноз загрузки по окнам филиала (на основе исторического распределения).
+**Описание:** Прогноз загрузки по окнам филиала на выбранный месяц "как обычно":
+- поток `predicted_visits` берется из прогноза по филиалу
+- распределение работы по окнам и типовое время обслуживания берутся из истории (baseline)
 
 **Response 200:**
 ```json
@@ -500,7 +502,22 @@ CREATE INDEX idx_employee_roles_branch_date ON employee_roles (branch_id, starte
 - `"underloaded"` -- загрузка 20-50%
 - `"idle"` -- загрузка < 20%
 
-Расчет загрузки: `load_percent = (actual_service_minutes / (60 * normativ_coefficient)) * 100`, где `normativ_coefficient` учитывает средний норматив услуги.
+Расчет загрузки (как обычно):
+1. Для каждого `(date, hour)` в запрошенном месяце взять:
+   - `predicted_visits(branch_id, date, hour)` из модели прогноза по филиалу
+   - `avg_service_minutes_baseline(branch_id, dow(date), hour)` из истории
+2. Посчитать объем работы филиала в минутах:
+   - `predicted_service_minutes = predicted_visits * avg_service_minutes_baseline`
+3. Распределить работу по окнам по историческим долям (окна стабильны внутри филиала):
+   - `predicted_service_minutes_window = predicted_service_minutes * window_share(branch_id, window_number, dow(date), hour)`
+4. Перевести в процент загрузки окна:
+   - `load_percent = predicted_service_minutes_window / 60 * 100`
+   - допускается `load_percent > 100` (спрос выше типовой емкости окна, означает рост очереди)
+5. `avg_visits` в `load_by_hour` (оценка обслуживаний в окне):
+   - `avg_visits = predicted_service_minutes_window / avg_service_minutes_baseline`
+   - если `avg_service_minutes_baseline` недоступен -> `avg_visits = 0`
+
+`avg_daily_load_percent` = среднее `load_percent` по рабочим дням и часам месяца.
 
 ##### 5. `GET /api/branches/{id}/staffing?month=2026-03`
 **Описание:** Рекомендации по количеству сотрудников.
@@ -527,9 +544,12 @@ CREATE INDEX idx_employee_roles_branch_date ON employee_roles (branch_id, starte
 
 **Формула расчета:**
 ```
-required_windows = ceil(predicted_visits * avg_service_minutes / 60)
+predicted_service_minutes = predicted_visits * avg_service_minutes
+required_windows = ceil(predicted_service_minutes / 60)
 ```
 Если `avg_service_minutes` недоступен, используется средний норматив из таблицы `services`.
+
+`current_windows_avg` = `windows_typical(branch_id, dow(date), hour)` (типовое кол-во активных окон "как обычно").
 
 ##### 6. `GET /api/branches/{id}/history?from=2023-01&to=2024-02`
 **Описание:** Исторические агрегированные данные (из `hourly_stats`).
@@ -591,6 +611,17 @@ required_windows = ceil(predicted_visits * avg_service_minutes / 60)
 }
 ```
 
+**Правила расчета (как обычно):**
+- `predicted_avg_service`:
+  - взвешенное по `predicted_visits` среднее `avg_service_minutes_baseline(branch_id, dow, hour)` за месяц
+- `required_windows(date, hour)`:
+  - `predicted_service_minutes = predicted_visits * avg_service_minutes_baseline`
+  - `required_windows = ceil(predicted_service_minutes / 60)`
+- `required_avg_windows`:
+  - среднее `required_windows(date, hour)` по рабочим дням и часам месяца
+- `overloaded_hours_count`:
+  - количество часов месяца, где `rho * 100 > 85`, `rho = predicted_service_minutes / (60 * windows_typical)`
+
 **Response 400:** `{"detail": "Provide 2-5 branch IDs"}` (если передано <2 или >5 ID)
 
 ##### 8. `GET /api/analytics/overview?month=2026-03`
@@ -611,6 +642,15 @@ required_windows = ceil(predicted_visits * avg_service_minutes / 60)
   ]
 }
 ```
+
+**Определения метрик (как обычно):**
+- `avg_load_percent` (для филиала):
+  - `rho = (predicted_visits * avg_service_minutes_baseline) / (60 * windows_typical)`
+  - `avg_load_percent = mean(rho * 100)` по рабочим дням и часам месяца
+- `overloaded_hours`:
+  - количество часов месяца, где `rho * 100 > 85`
+- `avg_predicted_wait`:
+  - среднее `predicted_avg_wait` по всем филиалам (взвешивание по `predicted_visits` допускается, но должно быть единообразно везде)
 
 ##### 9. `POST /api/data/upload`
 **Описание:** Загрузка нового CSV-файла (multipart/form-data).
@@ -705,6 +745,30 @@ num_employees_active = COUNT(DISTINCT employee_id) WHERE employee_id IS NOT NULL
 - Если в час нет записей -> `total_visits=0, served_visits=0, avg_wait=NULL, ...`
 - Нерабочие дни (воскресенье, праздники) -- не заполнять нулями, пропускать
 
+**Базовые статистики для расчета загрузки окон "как обычно":**
+
+Загрузка окон и ожидание зависят от "объема работы" в минутах и типовой емкости (сколько окон обычно работает в этот час).
+В MVP емкость на будущий месяц не задается расписанием, а берется из истории.
+
+Определения (для одного часа):
+- `predicted_visits` -- прогноз числа обращений, пришедших в очередь в этот час
+- `avg_service_minutes_baseline` -- типовое среднее время обслуживания (мин/обращение) для `(branch_id, day_of_week, hour)`
+- `windows_typical` -- типовое число активных окон (серверов) для `(branch_id, day_of_week, hour)` ("как обычно")
+- `predicted_service_minutes = predicted_visits * avg_service_minutes_baseline` -- прогноз требуемых минут обслуживания в этот час
+- `rho = predicted_service_minutes / (60 * windows_typical)` -- загрузка в долях (может быть > 1 при перегрузе)
+
+Как считать baseline из истории (период обучения):
+1. `avg_service_minutes_baseline(branch_id, dow, hour)`:
+   - базово: median/trimmed-mean по `hourly_stats.avg_service_minutes` для этого `(branch_id, dow, hour)`
+   - если `avg_service_minutes` часто NULL: считать `service_minutes_total` как `SUM(COALESCE(service_duration, services.normativ_minutes*60))/60` по `result_id=1` и делить на `served_visits`
+2. `windows_typical(branch_id, dow, hour)`:
+   - `P80(num_windows_active)` по `hourly_stats.num_windows_active` для этого `(branch_id, dow, hour)` (устойчивее среднего)
+   - ограничить `1 <= windows_typical <= num_windows` (физические окна филиала)
+3. Распределение по окнам (окна стабильны внутри филиала):
+   - `window_share(branch_id, window_number, dow, hour) = service_minutes_window / service_minutes_total`
+   - где `service_minutes_window` считается по истории из `queue_records` (по `employee_window`) для `result_id=1`
+   - fallback если мало данных: `(branch_id, window_number, hour)` -> `(branch_id, window_number)` -> равномерно по активным окнам
+
 **Feature engineering (для Prophet):**
 
 Prophet использует формат `ds` (datetime) + `y` (target). Дополнительные регрессоры:
@@ -737,6 +801,9 @@ Prophet использует формат `ds` (datetime) + `y` (target). Доп
 - Заполненная таблица `hourly_stats` в БД
 - Модуль `backend/app/ml/features.py` с функцией `prepare_prophet_data(branch_id) -> DataFrame`
 - Feature-набор: DataFrame с колонками `[ds, y, is_month_start, is_month_end, is_monday, is_weekend, is_friday]`
+- Модуль `backend/app/ml/baselines.py`:
+  - расчет `avg_service_minutes_baseline`, `windows_typical`, `window_share(...)` из исторических данных
+  - сохранение baseline в `models/baselines_branch_{id}.json` (или в БД для ускорения API)
 
 **Критерии приемки (DoD):**
 - [ ] `hourly_stats` содержит записи для всех 44 филиалов
@@ -746,6 +813,8 @@ Prophet использует формат `ds` (datetime) + `y` (target). Доп
 - [ ] Feature `is_holiday` корректно размечен для 2023-2024 годов
 - [ ] `prepare_prophet_data(branch_id)` возвращает DataFrame без NaN в колонке `y`
 - [ ] Количество строк в hourly_stats: ~44 филиала x ~290 рабочих дней x 12 часов ~ 153 000
+- [ ] `windows_typical` рассчитан и попадает в диапазон `1..num_windows` для каждого `(branch_id, dow, hour)`
+- [ ] Для каждого `(branch_id, dow, hour)` сумма `window_share(...)` по окнам ~= 1.0 (с учетом smoothing/fallback)
 
 ---
 
@@ -965,11 +1034,23 @@ Overall: 38/44 branches meet all criteria
    - Кэш инвалидируется при переобучении модели (`POST /api/model/retrain`)
 
 4. **Прогноз среднего времени ожидания:**
-   - Рассчитывается по формуле на основе predicted_visits, исторического avg_service_minutes и текущего кол-ва окон:
+   - Рассчитывается из модели очереди M/M/c (Erlang C) на базе `predicted_visits`, `avg_service_minutes_baseline` и `windows_typical` ("как обычно").
+   - Определения для одного часа:
+     - `c = windows_typical(branch_id, dow, hour)`
+     - `s = avg_service_minutes_baseline(branch_id, dow, hour)` (мин/визит)
+     - `a = predicted_visits * s / 60` (Erlangs, среднее число занятых серверов)
+     - `rho = a / c`
+   - Если `rho >= 1`, система перегружена (очередь растет). Для MVP:
+     - `predicted_avg_wait = WAIT_CAP_MINUTES` (например, 60)
+   - Иначе (`rho < 1`) использовать Erlang C:
      ```
-     predicted_avg_wait = (predicted_visits * avg_service_per_visit) / num_windows - avg_service_per_visit
+     # a = lambda/mu, c = servers, s = 1/mu (minutes)
+     P0 = 1 / ( sum_{n=0..c-1} a^n/n! + (a^c/c!) * (c/(c-a)) )
+     Pw = (a^c/c!) * (c/(c-a)) * P0
+     Wq = Pw * (s / (c - a))   # minutes
+     predicted_avg_wait = max(0, Wq)
      ```
-   - Ограничение: `max(0, predicted_avg_wait)`
+   - Требование: `predicted_avg_wait >= 0` и вычисление детерминировано (одинаково при повторном запросе).
 
 **Входные данные:** Обученные модели (pkl), запрос с `branch_id` и `month`.
 
@@ -1239,13 +1320,13 @@ interface ForecastSummary {
 
 interface WindowHourLoad {
   hour: number;
-  load_percent: number;
-  avg_visits: number;
+  load_percent: number;   // может быть > 100 при перегрузе (спрос выше типовой емкости окна)
+  avg_visits: number;     // оценка кол-ва обслуживаний в этом окне за час
 }
 
 interface WindowLoad {
   window_number: number;
-  avg_daily_load_percent: number;
+  avg_daily_load_percent: number;  // средняя загрузка окна за день (по рабочим дням/часам месяца)
   load_by_hour: WindowHourLoad[];
   status: 'overloaded' | 'normal' | 'underloaded' | 'idle';
 }
@@ -1421,7 +1502,7 @@ interface HeatmapChartProps {
 **Props:**
 ```typescript
 interface LoadIndicatorProps {
-  value: number;          // процент загрузки 0-100
+  value: number;          // процент загрузки (может быть > 100 при перегрузе)
   showValue?: boolean;    // показывать число
 }
 ```

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import func
@@ -14,23 +14,16 @@ from app.models import Branch, Forecast, HourlyStat, QueueRecord, Service
 
 logger = logging.getLogger(__name__)
 
-
 def get_forecast_data(
-    db: Session, branch_id: int, year: int, month: int
+    db: Session, branch_id: int, from_date: date, to_date: date
 ) -> list[dict]:
-    """Retrieve forecast data from the forecasts table for a given branch and month."""
-    start_date = date(year, month, 1)
-    if month == 12:
-        end_date = date(year + 1, 1, 1)
-    else:
-        end_date = date(year, month + 1, 1)
-
+    """Retrieve forecast data from the forecasts table for a given branch and date range."""
     rows = (
         db.query(Forecast)
         .filter(
             Forecast.branch_id == branch_id,
-            Forecast.date >= start_date,
-            Forecast.date < end_date,
+            Forecast.date >= from_date,
+            Forecast.date <= to_date,
         )
         .order_by(Forecast.date, Forecast.hour)
         .all()
@@ -89,23 +82,20 @@ def compute_forecast_summary(data: list[dict]) -> dict:
     }
 
 
-def get_window_stats(
-    db: Session, branch_id: int, year: int, month: int
+def _get_window_stats_history(
+    db: Session, branch_id: int, from_date: date, to_date: date
 ) -> list[dict]:
     """Compute window load statistics from historical queue_records."""
-    start_date = datetime(year, month, 1)
-    if month == 12:
-        end_date = datetime(year + 1, 1, 1)
-    else:
-        end_date = datetime(year, month + 1, 1)
+    start_date = datetime(from_date.year, from_date.month, from_date.day)
+    end_date = datetime(to_date.year, to_date.month, to_date.day, 23, 59, 59)
 
-    # Check for data in the requested month; fall back to latest available data
+    # Check for data in the requested range; fall back to latest available data
     count_check = (
         db.query(func.count(QueueRecord.id))
         .filter(
             QueueRecord.branch_id == branch_id,
             QueueRecord.registered_at >= start_date,
-            QueueRecord.registered_at < end_date,
+            QueueRecord.registered_at <= end_date,
             QueueRecord.employee_window.isnot(None),
         )
         .scalar()
@@ -173,7 +163,7 @@ def get_window_stats(
     avg_normativ_q = db.query(func.avg(Service.normativ_minutes)).filter(
         Service.normativ_minutes.isnot(None)
     )
-    avg_normativ = avg_normativ_q.scalar() or 15.0
+    avg_normativ = float(avg_normativ_q.scalar() or 15.0)
 
     # Organize by window
     window_data: dict[str, dict[int, dict]] = {}
@@ -196,8 +186,8 @@ def get_window_stats(
         for hour in range(8, 20):
             hd = hours_data.get(hour, {"count": 0, "avg_svc": None})
             avg_visits = hd["count"] / num_days
-            svc_min = (hd["avg_svc"] / 60.0) if hd["avg_svc"] else avg_normativ
-            load_pct = min(100.0, (avg_visits * svc_min / 60.0) * 100.0)
+            svc_min = (float(hd["avg_svc"]) / 60.0) if hd["avg_svc"] else avg_normativ
+            load_pct = round((avg_visits * svc_min / 60.0) * 100.0, 1)
             load_by_hour.append(
                 {
                     "hour": hour,
@@ -231,17 +221,212 @@ def get_window_stats(
     return windows_list
 
 
+def _get_window_stats_forecast(
+    db: Session, branch_id: int, from_date: date, to_date: date
+) -> list[dict]:
+    """Compute window load statistics from forecast data, distributing predicted
+    visits across windows proportionally to their historical share."""
+    from sqlalchemy import text
+
+    # 1. Get forecast data for the requested period
+    forecasts = (
+        db.query(Forecast)
+        .filter(
+            Forecast.branch_id == branch_id,
+            Forecast.date >= from_date,
+            Forecast.date <= to_date,
+        )
+        .order_by(Forecast.date, Forecast.hour)
+        .all()
+    )
+
+    if not forecasts:
+        return []
+
+    # 2. Get the historical window distribution from the last 30 days with data.
+    #    We find the latest record date, then go back 30 days from it.
+    latest_record_dt = (
+        db.query(func.max(QueueRecord.registered_at))
+        .filter(
+            QueueRecord.branch_id == branch_id,
+            QueueRecord.employee_window.isnot(None),
+        )
+        .scalar()
+    )
+
+    if latest_record_dt is None:
+        return []
+
+    hist_end = datetime(
+        latest_record_dt.year, latest_record_dt.month, latest_record_dt.day, 23, 59, 59
+    )
+    hist_start = datetime(
+        latest_record_dt.year, latest_record_dt.month, latest_record_dt.day
+    ) - timedelta(days=30)
+
+    distribution_sql = """
+        SELECT
+            employee_window,
+            CAST(EXTRACT(HOUR FROM registered_at) AS INTEGER) as hour,
+            COUNT(*) as visit_count
+        FROM queue_records
+        WHERE branch_id = :bid
+          AND registered_at >= :start
+          AND registered_at <= :end
+          AND employee_window IS NOT NULL
+          AND CAST(EXTRACT(HOUR FROM registered_at) AS INTEGER) >= 8
+          AND CAST(EXTRACT(HOUR FROM registered_at) AS INTEGER) < 20
+        GROUP BY employee_window, CAST(EXTRACT(HOUR FROM registered_at) AS INTEGER)
+        ORDER BY employee_window, CAST(EXTRACT(HOUR FROM registered_at) AS INTEGER)
+    """
+
+    dist_rows = db.execute(
+        text(distribution_sql),
+        {"bid": branch_id, "start": hist_start, "end": hist_end},
+    ).fetchall()
+
+    if not dist_rows:
+        return []
+
+    # 3. Compute per-hour total visits and per-window-per-hour share
+    #    hour_totals[hour] = total visits across all windows
+    #    window_hour_counts[window][hour] = visits for that window in that hour
+    hour_totals: dict[int, int] = {}
+    window_hour_counts: dict[str, dict[int, int]] = {}
+
+    for row in dist_rows:
+        w = str(row[0])
+        h = int(row[1])
+        cnt = int(row[2])
+        hour_totals[h] = hour_totals.get(h, 0) + cnt
+        if w not in window_hour_counts:
+            window_hour_counts[w] = {}
+        window_hour_counts[w][h] = cnt
+
+    # 4. Get average service time for load calculation
+    avg_normativ = (
+        db.query(func.avg(Service.normativ_minutes))
+        .filter(Service.normativ_minutes.isnot(None))
+        .scalar()
+    ) or 15.0
+
+    # Historical avg service seconds for this branch (more accurate than normativ)
+    avg_svc_seconds = (
+        db.query(func.avg(HourlyStat.avg_service_seconds))
+        .filter(
+            HourlyStat.branch_id == branch_id,
+            HourlyStat.avg_service_seconds.isnot(None),
+        )
+        .scalar()
+    )
+    avg_service_minutes = (float(avg_svc_seconds) / 60.0) if avg_svc_seconds else avg_normativ
+
+    # 5. Aggregate forecast: average predicted_visits per hour across all days
+    #    so we get a single "avg day" profile to match the historical approach
+    forecast_by_hour: dict[int, list[float]] = {}
+    for fc in forecasts:
+        if 8 <= fc.hour < 20:
+            forecast_by_hour.setdefault(fc.hour, []).append(fc.predicted_visits)
+
+    avg_forecast_per_hour: dict[int, float] = {}
+    for h, vals in forecast_by_hour.items():
+        avg_forecast_per_hour[h] = sum(vals) / len(vals)
+
+    # 6. Distribute forecast visits to windows proportionally
+    all_windows = sorted(window_hour_counts.keys(), key=lambda x: (len(x), x))
+    window_data: dict[str, dict[int, float]] = {w: {} for w in all_windows}
+
+    for hour in range(8, 20):
+        total_hist = hour_totals.get(hour, 0)
+        avg_predicted = avg_forecast_per_hour.get(hour, 0.0)
+
+        for w in all_windows:
+            w_hist = window_hour_counts[w].get(hour, 0)
+            if total_hist > 0:
+                share = w_hist / total_hist
+            else:
+                # Uniform distribution if no historical data for this hour
+                share = 1.0 / len(all_windows) if all_windows else 0.0
+            window_data[w][hour] = avg_predicted * share
+
+    # 7. Build result list
+    windows_list = []
+    for window_num in all_windows:
+        load_by_hour = []
+        total_load = 0.0
+        hours_counted = 0
+
+        for hour in range(8, 20):
+            predicted_visits = window_data[window_num].get(hour, 0.0)
+            load_pct = round((predicted_visits * avg_service_minutes / 60.0) * 100.0, 1)
+            load_by_hour.append(
+                {
+                    "hour": hour,
+                    "load_percent": round(load_pct, 1),
+                    "avg_visits": round(predicted_visits, 1),
+                }
+            )
+            total_load += load_pct
+            hours_counted += 1
+
+        avg_load = total_load / hours_counted if hours_counted else 0
+        status = (
+            "overloaded"
+            if avg_load > 85
+            else "normal"
+            if avg_load > 50
+            else "underloaded"
+            if avg_load > 20
+            else "idle"
+        )
+
+        windows_list.append(
+            {
+                "window_number": window_num,
+                "avg_daily_load_percent": round(avg_load, 1),
+                "load_by_hour": load_by_hour,
+                "status": status,
+            }
+        )
+
+    return windows_list
+
+
+def get_window_stats(
+    db: Session, branch_id: int, from_date: date, to_date: date
+) -> tuple[list[dict], str]:
+    """Compute window load statistics.
+
+    If *from_date* is in the future (after today) -- use forecast data
+    distributed across windows proportionally to their historical share.
+    Otherwise use the existing historical queue_records logic.
+
+    Returns
+    -------
+    tuple[list[dict], str]
+        (windows_list, data_source) where data_source is "forecast" or "history".
+    """
+    today = date.today()
+
+    if from_date > today:
+        windows = _get_window_stats_forecast(db, branch_id, from_date, to_date)
+        return windows, "forecast"
+
+    windows = _get_window_stats_history(db, branch_id, from_date, to_date)
+    return windows, "history"
+
+
 def get_staffing_recommendations(
-    db: Session, branch_id: int, year: int, month: int
+    db: Session, branch_id: int, from_date: date, to_date: date
 ) -> list[dict]:
     """Compute staffing recommendations based on forecast data and service norms."""
-    forecast_data = get_forecast_data(db, branch_id, year, month)
+    forecast_data = get_forecast_data(db, branch_id, from_date, to_date)
 
     # Get average service time from norms
     avg_normativ_q = db.query(func.avg(Service.normativ_minutes)).filter(
         Service.normativ_minutes.isnot(None)
     )
-    avg_normativ = avg_normativ_q.scalar() or 15.0
+    avg_normativ = float(avg_normativ_q.scalar() or 15.0)
 
     # Get historical average windows active for this branch
     avg_windows = (
@@ -263,7 +448,7 @@ def get_staffing_recommendations(
         )
         .scalar()
     )
-    avg_service_minutes = (avg_svc / 60.0) if avg_svc else avg_normativ
+    avg_service_minutes = (float(avg_svc) / 60.0) if avg_svc else avg_normativ
 
     recommendations = []
     for point in forecast_data:

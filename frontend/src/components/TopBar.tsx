@@ -1,36 +1,57 @@
+import type { DateRange } from './Layout';
+
 interface TopBarProps {
   title: string;
-  selectedMonth: string;
-  onMonthChange: (month: string) => void;
+  dateRange: DateRange;
+  onDateRangeChange: (range: DateRange) => void;
 }
 
-function getAvailableMonths(): { value: string; label: string }[] {
-  const months: { value: string; label: string }[] = [];
-  const monthNames = [
-    'Январь', 'Февраль', 'Март', 'Апрель',
-    'Май', 'Июнь', 'Июль', 'Август',
-    'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
-  ];
-  const now = new Date();
+function formatDateISO(d: Date): string {
+  const y = d.getFullYear();
+  const m = (d.getMonth() + 1).toString().padStart(2, '0');
+  const day = d.getDate().toString().padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
-  for (let offset = -6; offset <= 3; offset++) {
-    const d = new Date(now.getFullYear(), now.getMonth() + offset, 1);
-    const y = d.getFullYear();
-    const m = d.getMonth();
-    const value = `${y}-${String(m + 1).padStart(2, '0')}`;
-    const name = monthNames[m];
-    months.push({ value, label: `${name ?? ''} ${y}` });
-  }
+function formatDateRU(isoDate: string): string {
+  const [y, m, d] = isoDate.split('-');
+  return `${d}.${m}.${y}`;
+}
 
-  return months;
+function daysBetween(from: string, to: string): number {
+  const a = new Date(from);
+  const b = new Date(to);
+  return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function getMinDate(): string {
+  const d = new Date();
+  d.setMonth(d.getMonth() - 6);
+  return formatDateISO(d);
+}
+
+function getMaxDate(): string {
+  const d = new Date();
+  d.setMonth(d.getMonth() + 3);
+  return formatDateISO(d);
 }
 
 export default function TopBar({
   title,
-  selectedMonth,
-  onMonthChange,
+  dateRange,
+  onDateRangeChange,
 }: TopBarProps) {
-  const months = getAvailableMonths();
+  const days = daysBetween(dateRange.from, dateRange.to);
+
+  const handleFromChange = (newFrom: string) => {
+    const fromDate = new Date(newFrom);
+    const toDate = new Date(fromDate);
+    toDate.setDate(toDate.getDate() + 30);
+    onDateRangeChange({
+      from: newFrom,
+      to: formatDateISO(toDate),
+    });
+  };
 
   return (
     <header className="h-14 bg-white border-b border-[#E2E8F0] flex items-center justify-between px-6 shrink-0">
@@ -38,21 +59,21 @@ export default function TopBar({
         {title}
       </h1>
       <div className="flex items-center gap-3">
-        <label className="text-sm text-[#64748B]" htmlFor="month-picker">
+        <label className="text-sm text-[#64748B]" htmlFor="date-from-picker">
           Период:
         </label>
-        <select
-          id="month-picker"
-          value={selectedMonth}
-          onChange={(e) => onMonthChange(e.target.value)}
+        <input
+          id="date-from-picker"
+          type="date"
+          value={dateRange.from}
+          min={getMinDate()}
+          max={getMaxDate()}
+          onChange={(e) => handleFromChange(e.target.value)}
           className="px-3 py-1.5 border border-[#E2E8F0] rounded text-sm text-[#0F172A] bg-white focus:outline-none focus:border-[#2563EB] cursor-pointer"
-        >
-          {months.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
+        />
+        <span className="text-sm text-[#64748B]">
+          {formatDateRU(dateRange.from)} — {formatDateRU(dateRange.to)} ({days} дней)
+        </span>
       </div>
     </header>
   );

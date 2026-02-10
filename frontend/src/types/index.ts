@@ -29,22 +29,23 @@ export interface ForecastPoint {
   date: string;
   hour: number;
   predicted_visits: number;
-  predicted_avg_wait: number;
-  confidence_lower: number;
-  confidence_upper: number;
+  predicted_avg_wait: number | null;
+  confidence_lower: number | null;
+  confidence_upper: number | null;
 }
 
 export interface ForecastSummary {
   total_predicted_visits: number;
-  peak_day: string;
-  peak_hour: number;
+  peak_day: string | null;
+  peak_hour: number | null;
   avg_daily_visits: number;
 }
 
 export interface ForecastResponse {
   branch_id: number;
   branch_name: string;
-  month: string;
+  from_date: string;
+  to_date: string;
   data: ForecastPoint[];
   summary: ForecastSummary;
 }
@@ -66,8 +67,10 @@ export interface WindowLoad {
 
 export interface WindowsResponse {
   branch_id: number;
-  month: string;
+  from_date: string;
+  to_date: string;
   windows: WindowLoad[];
+  data_source: 'forecast' | 'history';
 }
 
 // === Рекомендации по штату ===
@@ -85,7 +88,8 @@ export interface StaffingRecommendation {
 
 export interface StaffingResponse {
   branch_id: number;
-  month: string;
+  from_date: string;
+  to_date: string;
   recommendations: StaffingRecommendation[];
 }
 
@@ -96,7 +100,7 @@ export interface DailyHistory {
   total_visits: number;
   avg_wait_minutes: number | null;
   avg_service_minutes: number | null;
-  peak_hour: number;
+  peak_hour: number | null;
 }
 
 export interface HourlyHistory {
@@ -110,7 +114,7 @@ export interface HourlyHistory {
 
 export interface HistoryResponse {
   branch_id: number;
-  period: { from: string; to: string };
+  period: { from_date: string; to_date: string };
   daily: DailyHistory[];
   hourly: HourlyHistory[];
 }
@@ -126,10 +130,12 @@ export interface BranchComparison {
   predicted_peak_hour: number | null;
   required_avg_windows: number;
   overloaded_hours_count: number;
+  load_percent: number | null;
 }
 
 export interface ComparisonResponse {
-  month: string;
+  from_date: string;
+  to_date: string;
   branches: BranchComparison[];
 }
 
@@ -150,12 +156,36 @@ export interface UnderloadedBranch {
 }
 
 export interface OverviewResponse {
-  month: string;
+  from_date: string;
+  to_date: string;
   total_branches: number;
   total_predicted_visits: number;
   avg_predicted_wait: number;
   top_overloaded: OverloadedBranch[];
   top_underloaded: UnderloadedBranch[];
+}
+
+// === Генерация прогноза ===
+
+export interface ForecastGenerateRequest {
+  from_date: string;
+  to_date: string;
+  branch_id?: number | null;
+}
+
+export interface ForecastGenerateResponse {
+  status: string;
+  message: string;
+  total_branches: number;
+}
+
+export interface ForecastGenerationStatus {
+  status: 'idle' | 'running' | 'completed' | 'error';
+  progress: number;
+  total_branches: number;
+  current_branch_name: string | null;
+  started_at: string | null;
+  error_message: string | null;
 }
 
 // === Общие типы UI ===

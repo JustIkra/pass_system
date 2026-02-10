@@ -37,6 +37,7 @@ class BranchDetail(BaseModel):
     name: str | None
     depart_name_mfc: str | None
     total_records: int
+    date_range: DateRange
     num_employees: int
     num_windows: int
     avg_daily_visits: float
@@ -70,7 +71,8 @@ class ForecastSummary(BaseModel):
 class ForecastResponse(BaseModel):
     branch_id: int
     branch_name: str | None
-    month: str
+    from_date: str
+    to_date: str
     data: list[ForecastPoint]
     summary: ForecastSummary
 
@@ -93,8 +95,10 @@ class WindowLoad(BaseModel):
 
 class WindowsResponse(BaseModel):
     branch_id: int
-    month: str
+    from_date: str
+    to_date: str
     windows: list[WindowLoad]
+    data_source: str  # "forecast" or "history"
 
 
 # ---- Staffing schemas ----
@@ -113,7 +117,8 @@ class StaffingRecommendation(BaseModel):
 
 class StaffingResponse(BaseModel):
     branch_id: int
-    month: str
+    from_date: str
+    to_date: str
     recommendations: list[StaffingRecommendation]
 
 
@@ -156,10 +161,12 @@ class ComparisonRow(BaseModel):
     predicted_peak_hour: int | None
     required_avg_windows: float
     overloaded_hours_count: int
+    load_percent: float | None
 
 
 class ComparisonResponse(BaseModel):
-    month: str
+    from_date: str
+    to_date: str
     branches: list[ComparisonRow]
 
 
@@ -181,7 +188,8 @@ class UnderloadedBranch(BaseModel):
 
 
 class OverviewResponse(BaseModel):
-    month: str
+    from_date: str
+    to_date: str
     total_branches: int
     total_predicted_visits: float
     avg_predicted_wait: float
@@ -210,3 +218,27 @@ class ModelStatusResponse(BaseModel):
     total_branches: int
     current_branch: str | None
     started_at: str | None
+
+
+# ---- Forecast generation schemas ----
+
+
+class ForecastGenerateRequest(BaseModel):
+    from_date: str
+    to_date: str
+    branch_id: int | None = None
+
+
+class ForecastGenerateResponse(BaseModel):
+    status: str
+    message: str
+    total_branches: int
+
+
+class ForecastGenerationStatus(BaseModel):
+    status: str  # idle / running / completed / error
+    progress: int
+    total_branches: int
+    current_branch_name: str | None
+    started_at: str | None
+    error_message: str | None

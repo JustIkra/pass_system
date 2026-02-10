@@ -43,7 +43,7 @@ export default function LineChart({ data, title, yAxisLabel }: LineChartProps) {
   const lowerValues = data.map((d) => d.lower);
   const upperValues = data.map((d) => d.upper);
 
-  const option: echarts.EChartsOption = {
+  const option: echarts.EChartsCoreOption = {
     title: title
       ? {
           text: title,

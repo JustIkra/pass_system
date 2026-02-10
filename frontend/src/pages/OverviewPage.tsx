@@ -1,11 +1,11 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useLayoutContext } from '../components/Layout';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import KpiCard from '../components/KpiCard';
 import LoadIndicator from '../components/LoadIndicator';
-import type { OverviewResponse, Branch } from '../types';
+import type { OverviewResponse, Branch, ForecastGenerationStatus } from '../types';
 
 function formatNum(n: number): string {
   return Math.round(n)
@@ -18,7 +18,7 @@ function formatWait(minutes: number): string {
 }
 
 export default function OverviewPage() {
-  const { selectedMonth, setPageTitle } = useLayoutContext();
+  const { dateRange, setPageTitle } = useLayoutContext();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -30,7 +30,10 @@ export default function OverviewPage() {
     loading,
     error,
     refetch,
-  } = useApi<OverviewResponse>(() => api.getOverview(selectedMonth), [selectedMonth]);
+  } = useApi<OverviewResponse>(
+    () => api.getOverview(dateRange.from, dateRange.to),
+    [dateRange.from, dateRange.to]
+  );
 
   if (loading) {
     return (
@@ -61,17 +64,11 @@ export default function OverviewPage() {
 
   if (!data) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center text-[#64748B]">
-          <p className="text-lg mb-2">Прогноз не сгенерирован</p>
-          <p className="text-sm">
-            Запустите скрипт{' '}
-            <code className="bg-[#F1F5F9] px-2 py-0.5 rounded text-[#0F172A]">
-              generate_forecast.py
-            </code>
-          </p>
-        </div>
-      </div>
+      <ForecastGenerationPanel
+        fromDate={dateRange.from}
+        toDate={dateRange.to}
+        onComplete={refetch}
+      />
     );
   }
 
@@ -80,6 +77,15 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-6">
+      {/* Regenerate button */}
+      <div className="flex justify-end">
+        <RegenerateButton
+          fromDate={dateRange.from}
+          toDate={dateRange.to}
+          onComplete={refetch}
+        />
+      </div>
+
       {/* KPI Cards */}
       <div className="grid grid-cols-4 gap-4">
         <KpiCard
@@ -142,7 +148,7 @@ export default function OverviewPage() {
                       {formatWait(b.predicted_avg_wait)}
                     </td>
                     <td className="text-center px-4 py-2.5">
-                      <LoadIndicator value={90} showLabel />
+                      <LoadIndicator value={Math.min(100, Math.round(b.predicted_avg_wait / 20 * 100))} showLabel />
                     </td>
                   </tr>
                 ))}
@@ -282,12 +288,12 @@ function AllBranchesTable({
               <th
                 className="text-right px-4 py-2 font-medium cursor-pointer hover:text-[#0F172A] select-none"
                 onClick={() => toggleSort('total_records')}
+                title="Общее количество обращений за весь период наблюдений"
               >
-                Обращений{' '}
+                Обращений (всего){' '}
                 {sortField === 'total_records' &&
                   (sortDir === 'asc' ? '\u2191' : '\u2193')}
               </th>
-              <th className="text-center px-4 py-2 font-medium">Статус</th>
             </tr>
           </thead>
           <tbody>
@@ -306,15 +312,12 @@ function AllBranchesTable({
                 <td className="text-right px-4 py-2.5 text-[#0F172A]">
                   {formatNum(b.total_records)}
                 </td>
-                <td className="text-center px-4 py-2.5">
-                  <LoadIndicator value={50} size="sm" />
-                </td>
               </tr>
             ))}
             {filtered.length === 0 && (
               <tr>
                 <td
-                  colSpan={4}
+                  colSpan={3}
                   className="px-4 py-6 text-center text-[#64748B]"
                 >
                   Нет данных для отображения
@@ -325,5 +328,190 @@ function AllBranchesTable({
         </table>
       </div>
     </div>
+  );
+}
+
+// --- Forecast generation components ---
+
+function useGenerationPoller(onComplete: () => void) {
+  const [genStatus, setGenStatus] = useState<ForecastGenerationStatus | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  const startPolling = useCallback(() => {
+    stopPolling();
+    intervalRef.current = setInterval(async () => {
+      try {
+        const s = await api.getForecastGenerationStatus();
+        setGenStatus(s);
+        if (s.status === 'completed' || s.status === 'error') {
+          stopPolling();
+          if (s.status === 'completed') {
+            onComplete();
+          }
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 2000);
+  }, [stopPolling, onComplete]);
+
+  useEffect(() => {
+    return stopPolling;
+  }, [stopPolling]);
+
+  return { genStatus, startPolling, stopPolling, setGenStatus };
+}
+
+function ForecastGenerationPanel({
+  fromDate,
+  toDate,
+  branchId,
+  onComplete,
+}: {
+  fromDate: string;
+  toDate: string;
+  branchId?: number;
+  onComplete: () => void;
+}) {
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { genStatus, startPolling, setGenStatus } = useGenerationPoller(onComplete);
+
+  const handleGenerate = async () => {
+    setStarting(true);
+    setError(null);
+    try {
+      await api.generateForecast({
+        from_date: fromDate,
+        to_date: toDate,
+        branch_id: branchId ?? null,
+      });
+      setGenStatus({
+        status: 'running',
+        progress: 0,
+        total_branches: 0,
+        current_branch_name: null,
+        started_at: new Date().toISOString(),
+        error_message: null,
+      });
+      startPolling();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка запуска генерации');
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const isRunning = genStatus?.status === 'running';
+  const isCompleted = genStatus?.status === 'completed';
+  const hasError = genStatus?.status === 'error';
+
+  return (
+    <div className="flex items-center justify-center h-64">
+      <div className="text-center">
+        {!genStatus || genStatus.status === 'idle' ? (
+          <>
+            <p className="text-lg mb-2 text-[#64748B]">Прогноз не сгенерирован</p>
+            <p className="text-sm text-[#64748B] mb-4">
+              Нажмите кнопку для генерации прогноза на выбранный период
+            </p>
+            <button
+              onClick={handleGenerate}
+              disabled={starting}
+              className="px-5 py-2.5 bg-[#2563EB] text-white rounded-lg text-sm font-medium hover:bg-[#1D4ED8] disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {starting ? 'Запуск...' : 'Сгенерировать прогноз'}
+            </button>
+            {error && <p className="text-[#EF4444] text-sm mt-3">{error}</p>}
+          </>
+        ) : isRunning ? (
+          <>
+            <div className="w-8 h-8 border-3 border-[#2563EB] border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+            <p className="text-sm font-medium text-[#0F172A] mb-1">
+              Генерация прогноза...
+            </p>
+            {genStatus.total_branches > 0 && (
+              <>
+                <div className="w-64 h-2 bg-[#E2E8F0] rounded-full mx-auto mb-2">
+                  <div
+                    className="h-2 bg-[#2563EB] rounded-full transition-all"
+                    style={{
+                      width: `${Math.round((genStatus.progress / genStatus.total_branches) * 100)}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-[#64748B]">
+                  {genStatus.progress}/{genStatus.total_branches} филиалов
+                  {genStatus.current_branch_name && (
+                    <span className="ml-1">({genStatus.current_branch_name})</span>
+                  )}
+                </p>
+              </>
+            )}
+          </>
+        ) : isCompleted ? (
+          <p className="text-sm text-[#22C55E]">Генерация завершена. Загрузка данных...</p>
+        ) : hasError ? (
+          <>
+            <p className="text-[#EF4444] mb-3">{genStatus.error_message}</p>
+            <button
+              onClick={handleGenerate}
+              className="px-5 py-2.5 bg-[#2563EB] text-white rounded-lg text-sm font-medium hover:bg-[#1D4ED8]"
+            >
+              Повторить
+            </button>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function RegenerateButton({
+  fromDate,
+  toDate,
+  onComplete,
+}: {
+  fromDate: string;
+  toDate: string;
+  onComplete: () => void;
+}) {
+  const [starting, setStarting] = useState(false);
+  const { genStatus, startPolling } = useGenerationPoller(onComplete);
+
+  const handleRegenerate = async () => {
+    setStarting(true);
+    try {
+      await api.generateForecast({
+        from_date: fromDate,
+        to_date: toDate,
+      });
+      startPolling();
+    } catch {
+      // silently ignore — user can retry
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const isRunning = genStatus?.status === 'running';
+
+  return (
+    <button
+      onClick={handleRegenerate}
+      disabled={starting || isRunning}
+      className="px-4 py-2 text-sm border border-[#E2E8F0] rounded-lg text-[#64748B] hover:bg-[#F8FAFC] hover:text-[#0F172A] disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      {isRunning
+        ? `Генерация... ${genStatus.progress}/${genStatus.total_branches}`
+        : 'Обновить прогноз'}
+    </button>
   );
 }

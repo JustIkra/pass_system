@@ -106,6 +106,9 @@ def _escape_copy_val(v: Any) -> str:
     if v is None:
         return "\\N"
     s = str(v)
+    # Handle pandas NaT/NaN as NULL
+    if s in ("NaT", "nan", "NaN", "<NA>", "None"):
+        return "\\N"
     s = s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
     return s
 
@@ -120,6 +123,7 @@ def _copy_dataframe_to_table(
     table_name: str,
     columns: list[str],
     db_url: str,
+    disable_fk: bool = True,
 ) -> int:
     """Load a DataFrame into PostgreSQL using COPY FROM (fastest method)."""
     if df.empty:
@@ -138,6 +142,8 @@ def _copy_dataframe_to_table(
     raw_conn = engine.raw_connection()
     try:
         cursor = raw_conn.cursor()
+        if disable_fk:
+            cursor.execute("SET session_replication_role = 'replica'")
         cursor.copy_expert(copy_sql, buf)
         raw_conn.commit()
         return len(df)
@@ -152,6 +158,7 @@ def _copy_tsv_buffer_to_table(
     table_name: str,
     columns: list[str],
     db_url: str,
+    disable_fk: bool = True,
 ) -> int:
     """Load a pre-built TSV buffer into PostgreSQL using COPY FROM.
 
@@ -169,6 +176,8 @@ def _copy_tsv_buffer_to_table(
     raw_conn = engine.raw_connection()
     try:
         cursor = raw_conn.cursor()
+        if disable_fk:
+            cursor.execute("SET session_replication_role = 'replica'")
         cursor.copy_expert(copy_sql, buf)
         raw_conn.commit()
         return row_count

@@ -61,7 +61,7 @@
 | `test_get_forecast` | `GET /api/branches/176/forecast?month=2026-03` | Прогноз загрузки | 200, `data` содержит записи для каждого рабочего дня месяца и каждого часа (8-19), `summary` заполнен |
 | `test_forecast_values_positive` | `GET /api/branches/176/forecast?month=2026-03` | Все прогнозные значения неотрицательные | Для всех точек: `predicted_visits >= 0`, `predicted_avg_wait >= 0` |
 | `test_forecast_confidence` | `GET /api/branches/176/forecast?month=2026-03` | Доверительный интервал корректен | Для всех точек: `confidence_lower <= predicted_visits <= confidence_upper` |
-| `test_windows_load` | `GET /api/branches/176/windows?month=2026-03` | Данные по окнам филиала | 200, массив `windows` с `window_number`, `avg_daily_load_percent`, `load_by_hour`, `status` |
+| `test_windows_load` | `GET /api/branches/176/windows?month=2026-03` | Данные по окнам филиала | 200, массив `windows` с `window_number`, `avg_daily_load_percent`, `load_by_hour`, `status`; для всех `load_by_hour`: `load_percent >= 0` (может быть > 100 при перегрузе) |
 | `test_windows_status_values` | `GET /api/branches/176/windows?month=2026-03` | Статус окон из допустимого набора | Все `status` принадлежат `{"overloaded", "normal", "underloaded", "idle"}` |
 | `test_staffing` | `GET /api/branches/176/staffing?month=2026-03` | Рекомендации по штату | 200, `recommendations` содержит значения для каждого рабочего дня x часа (8-19), поля `required_windows`, `delta`, `status` |
 | `test_staffing_status_values` | `GET /api/branches/176/staffing?month=2026-03` | Статус штата из допустимого набора | Все `status` принадлежат `{"understaffed", "optimal", "overstaffed"}` |
@@ -102,6 +102,9 @@
 | `test_ci_coverage` | Coverage доверительного интервала (80% CI) > 75% на test data | Факт vs прогноз на тестовом периоде | >= 75% фактических значений попадают в интервал `[yhat_lower, yhat_upper]` |
 | `test_holiday_effect` | Модель учитывает праздники РФ (снижение трафика) | Прогноз на январь (1-8 -- каникулы) | `predicted_visits` для 1-8 января ниже, чем для 10-15 января |
 | `test_feature_engineering` | `prepare_prophet_data()` возвращает корректный DataFrame | Данные `hourly_stats` для филиала 176 | DataFrame содержит колонки `[ds, y, day_of_week, month, is_holiday, is_month_start, is_month_end, is_monday]`, нет NaN в `y` |
+| `test_windows_typical_range` | `windows_typical` попадает в диапазон 1..num_windows | Baseline для филиала 176 | Для каждого `(dow, hour)`: `1 <= windows_typical <= num_windows` |
+| `test_window_share_normalized` | `window_share` нормализован | Baseline для филиала 176 | Для каждого `(dow, hour)`: сумма долей по окнам ~= 1.0 (с учетом smoothing) |
+| `test_wait_overload_cap` | Ожидание ограничено cap при перегрузе | Смоделированные `predicted_visits` так, что `rho>=1` | `predicted_avg_wait == WAIT_CAP_MINUTES` |
 | `test_model_serialization` | Модель корректно сохраняется и загружается | Обученная модель | `joblib.dump()` + `joblib.load()` -> прогноз идентичен |
 | `test_forecast_caching` | Повторный запрос прогноза возвращает кэшированный результат | Два вызова `predict(branch_id, month)` | Второй вызов < 100 мс, результаты идентичны |
 | `test_cache_invalidation` | Кэш инвалидируется после переобучения | `invalidate_cache()` -> повторный `predict()` | Прогноз пересчитан (timestamp `created_at` обновлен) |

@@ -10,4 +10,3 @@ python-multipart==0.0.9
 prophet==1.1.5
 cmdstanpy==1.2.0
 joblib==1.4.0
-pyopencl==2024.1

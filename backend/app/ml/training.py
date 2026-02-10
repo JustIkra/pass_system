@@ -124,6 +124,16 @@ def prepare_training_data(
     # Track original (non-zero-filled) row count for MIN_DATA_POINTS checks
     original_count = len(df)
 
+    # ---- Winsorize wait time outliers ----
+    # Wait time data has extreme outliers (max ~467 min, P99 ~24 min).
+    # Clip at P95 to prevent log1p from amplifying rare spikes.
+    is_wait_target = target in ("avg_wait_minutes", "avg_wait_seconds")
+    if is_wait_target:
+        positive_vals = df.loc[df["y"] > 0, "y"]
+        if len(positive_vals) > 0:
+            p95 = float(positive_vals.quantile(0.95))
+            df["y"] = df["y"].clip(upper=p95)
+
     # ---- Fill missing hourly slots with 0 ----
     # Branches may have gaps (closed early, no visitors). Prophet needs
     # a complete grid to avoid incorrect interpolation.
@@ -143,6 +153,10 @@ def prepare_training_data(
     # ---- Log transform ----
     # Stabilises variance, prevents negative predictions, suits count data.
     df["y"] = np.log1p(df["y"])
+
+    # Store the log-scale cap for wait models (used by Prophet logistic growth)
+    if is_wait_target and len(positive_vals) > 0:
+        df.attrs["log_cap"] = float(np.log1p(p95 * 2.0))  # 2x P95 margin
 
     # Add regressors
     df = add_regressors(df)
@@ -170,31 +184,48 @@ def _build_prophet(
     df: pd.DataFrame,
     holidays_df: pd.DataFrame | None = None,
     use_gpu: bool = False,
+    is_wait_model: bool = False,
 ) -> Prophet:
     """Construct a configured :class:`Prophet` instance.
 
     The model uses:
     * weekly seasonality (auto)
     * yearly seasonality (enabled only when data spans >= 12 months)
-    * custom *intraday* seasonality (period=1 day, fourier_order=8)
+    * custom *intraday* seasonality (period=1 day, fourier_order=3)
     * Russian holidays
     * regressors: ``is_month_start``, ``is_month_end``, ``is_monday``
     * GPU-accelerated MCMC via CmdStanPy OpenCL (if ``use_gpu=True``)
+
+    For wait models (``is_wait_model=True``):
+    * Uses logistic growth with a cap to bound predictions
+    * Uses tighter changepoint_prior_scale (0.05) to avoid spike overfitting
     """
     data_span_days = (df["ds"].max() - df["ds"].min()).days
     yearly = data_span_days >= 365
 
     stan_backend = _try_cmdstanpy()
 
-    kwargs: dict[str, Any] = dict(
-        yearly_seasonality=yearly,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        changepoint_prior_scale=0.15,
-        seasonality_prior_scale=1.0,
-        holidays_prior_scale=1.0,
-        interval_width=0.80,
-    )
+    if is_wait_model:
+        kwargs: dict[str, Any] = dict(
+            growth="logistic",
+            yearly_seasonality=yearly,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.05,
+            seasonality_prior_scale=0.5,
+            holidays_prior_scale=1.0,
+            interval_width=0.80,
+        )
+    else:
+        kwargs = dict(
+            yearly_seasonality=yearly,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.15,
+            seasonality_prior_scale=1.0,
+            holidays_prior_scale=1.0,
+            interval_width=0.80,
+        )
 
     if stan_backend:
         kwargs["stan_backend"] = stan_backend
@@ -223,6 +254,7 @@ def train_branch_model(
     df: pd.DataFrame,
     holidays_df: pd.DataFrame | None = None,
     use_gpu: bool = False,
+    wait_log_cap: float | None = None,
 ) -> tuple[Prophet, Prophet]:
     """Train visits and wait-time Prophet models for a single branch.
 
@@ -239,6 +271,9 @@ def train_branch_model(
         Holidays DataFrame for Prophet.
     use_gpu:
         If ``True``, configure Stan OpenCL backend for GPU acceleration.
+    wait_log_cap:
+        Log-scale cap for wait model logistic growth.  If ``None``,
+        computed from ``y_wait`` P95 in the training data.
 
     Returns
     -------
@@ -252,19 +287,34 @@ def train_branch_model(
     visits_model.fit(df[["ds", "y"] + REGRESSOR_COLUMNS])
 
     # --- Wait model ---
-    # If df has y_wait column, use it.  Otherwise build a trivial model from
-    # the same df with y replaced.
-    wait_model = _build_prophet(df, holidays_df, use_gpu=use_gpu)
-
+    # Uses logistic growth with cap to bound predictions and prevent
+    # expm1 explosion from log-scale models.
     if "y_wait" in df.columns:
         wait_df = df[["ds"] + REGRESSOR_COLUMNS].copy()
         wait_df["y"] = df["y_wait"]
     else:
-        # Caller should supply a wait df; as fallback train on zeros
         wait_df = df[["ds", "y"] + REGRESSOR_COLUMNS].copy()
         wait_df["y"] = 0.0
 
+    # Set logistic growth cap/floor for wait model.
+    # wait_log_cap is computed from original-scale P95 in prepare_training_data.
+    if wait_log_cap is None:
+        # Fallback: compute from log-scale data (less accurate)
+        positive_y = wait_df.loc[wait_df["y"] > 0, "y"]
+        if len(positive_y) > 0:
+            # Convert back: P95 of log values -> expm1 -> multiply 2x -> log1p
+            p95_log = float(positive_y.quantile(0.95))
+            wait_log_cap = float(np.log1p(np.expm1(p95_log) * 2.0))
+        else:
+            wait_log_cap = float(np.log1p(60.0))  # fallback: ~60 min
+    wait_df["cap"] = wait_log_cap
+    wait_df["floor"] = 0.0
+
+    wait_model = _build_prophet(df, holidays_df, use_gpu=use_gpu, is_wait_model=True)
     wait_model.fit(wait_df)
+
+    # Store the log-scale cap as model metadata so prediction can use it
+    wait_model.wait_log_cap = wait_log_cap  # type: ignore[attr-defined]
 
     return visits_model, wait_model
 
@@ -277,6 +327,7 @@ def _train_branch_worker(
     models_dir: str,
     validate: bool,
     use_gpu: bool = False,
+    wait_log_cap: float | None = None,
 ) -> dict[str, Any]:
     """Train a single branch in a worker process.
 
@@ -294,7 +345,9 @@ def _train_branch_worker(
     models_path = Path(models_dir)
     t0 = time.time()
 
-    visits_model, wait_model = train_branch_model(branch_id, df_train, holidays_df, use_gpu=use_gpu)
+    visits_model, wait_model = train_branch_model(
+        branch_id, df_train, holidays_df, use_gpu=use_gpu, wait_log_cap=wait_log_cap,
+    )
     elapsed = time.time() - t0
 
     # Save models to disk directly from worker
@@ -403,7 +456,7 @@ def train_all_models(
     }
 
     # ---- Phase 1: Fetch data sequentially (DB session not shareable) ----
-    tasks: list[tuple[int, pd.DataFrame, pd.DataFrame]] = []
+    tasks: list[tuple[int, pd.DataFrame, pd.DataFrame, float | None]] = []
     last_df_visits = pd.DataFrame()
 
     for idx, bid in enumerate(branch_ids, 1):
@@ -422,6 +475,7 @@ def train_all_models(
         # NOTE: prepare_training_data already applies log1p, so y_wait is
         # already log-transformed when it comes from that function.
         df_wait = prepare_training_data(db_session, bid, target="avg_wait_minutes")
+        wait_log_cap: float | None = df_wait.attrs.get("log_cap")
         if not df_wait.empty and len(df_wait) == len(df_visits):
             df_visits["y_wait"] = df_wait["y"].values
         else:
@@ -442,7 +496,7 @@ def train_all_models(
             df_train = df_visits
             df_test = pd.DataFrame()
 
-        tasks.append((bid, df_train, df_test))
+        tasks.append((bid, df_train, df_test, wait_log_cap))
         last_df_visits = df_visits
 
     logger.info("Data fetched for %d branches. Starting parallel training...", len(tasks))
@@ -453,11 +507,11 @@ def train_all_models(
 
     # Use single process if only 1 branch or 1 worker
     if n_workers <= 1 or len(tasks) <= 1:
-        for bid, df_train, df_test in tasks:
+        for bid, df_train, df_test, w_log_cap in tasks:
             logger.info("Training branch %d (sequential)%s", bid, " [GPU]" if use_gpu else "")
             branch_report = _train_branch_worker(
                 bid, df_train, df_test, holidays_df, str(models_dir), validate,
-                use_gpu=use_gpu,
+                use_gpu=use_gpu, wait_log_cap=w_log_cap,
             )
             total_time += branch_report["training_seconds"]
             report["branches"].append(branch_report)
@@ -475,11 +529,11 @@ def train_all_models(
     else:
         futures = {}
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            for bid, df_train, df_test in tasks:
+            for bid, df_train, df_test, w_log_cap in tasks:
                 fut = pool.submit(
                     _train_branch_worker,
                     bid, df_train, df_test, holidays_df,
-                    str(models_dir), validate, use_gpu,
+                    str(models_dir), validate, use_gpu, w_log_cap,
                 )
                 futures[fut] = bid
 

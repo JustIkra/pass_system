@@ -40,7 +40,7 @@ export default function BarChart({
 }: BarChartProps) {
   const sorted = [...data].sort((a, b) => b.value - a.value);
 
-  const option: echarts.EChartsOption = {
+  const option: echarts.EChartsCoreOption = {
     title: title
       ? {
           text: title,

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""CLI: generate forecasts for a given month and persist them to the DB.
+"""CLI: generate forecasts for a given month (or arbitrary date range) and persist them to the DB.
 
 Usage::
 
+    # Monthly mode
     python scripts/generate_forecast.py \\
         --db-url sqlite:///./data/mfc.db \\
         --models-dir ./models \\
         --month 2026-03
+
+    # Date range mode (30 days from a given date)
+    python scripts/generate_forecast.py \\
+        --db-url sqlite:///./data/mfc.db \\
+        --models-dir ./models \\
+        --from-date 2026-03-01 --days 30
 
     # Single branch
     python scripts/generate_forecast.py \\
@@ -24,6 +31,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, timedelta
 from multiprocessing import cpu_count
 from pathlib import Path
 
@@ -40,6 +48,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.ml.prediction import (
     generate_forecast,
+    generate_forecast_range,
     load_models,
     save_forecast_to_db,
 )
@@ -63,9 +72,25 @@ def _generate_branch_forecast(
         return bid, None
 
 
+def _generate_branch_forecast_range(
+    bid: int, start_date: date, end_date: date, models_dir: str,
+) -> tuple[int, list | None]:
+    """Generate forecast for a single branch over a date range in a worker process."""
+    from app.ml.prediction import generate_forecast_range, load_models
+
+    models = load_models(models_dir)
+    if bid not in models:
+        return bid, None
+    try:
+        points = generate_forecast_range(bid, start_date, end_date, models)
+        return bid, points
+    except Exception:
+        return bid, None
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate monthly forecasts for MFC branches and save to DB.",
+        description="Generate forecasts for MFC branches and save to DB.",
     )
     parser.add_argument(
         "--db-url",
@@ -79,11 +104,27 @@ def _parse_args() -> argparse.Namespace:
         default="./models",
         help="Directory containing trained model files (default: ./models)",
     )
-    parser.add_argument(
+
+    # Mutually exclusive: --month OR --from-date/--days
+    period_group = parser.add_mutually_exclusive_group(required=True)
+    period_group.add_argument(
         "--month",
         type=str,
-        required=True,
+        default=None,
         help="Target month in YYYY-MM format (e.g. 2026-03).",
+    )
+    period_group.add_argument(
+        "--from-date",
+        type=str,
+        default=None,
+        help="Start date in YYYY-MM-DD format (default: today). Use with --days.",
+    )
+
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Number of days to forecast from --from-date (default: 30).",
     )
     parser.add_argument(
         "--branch-id",
@@ -119,6 +160,14 @@ def _parse_month(month_str: str) -> tuple[int, int]:
     return year, month
 
 
+def _parse_date(date_str: str) -> date:
+    """Parse ``"YYYY-MM-DD"`` into a :class:`date`."""
+    try:
+        return date.fromisoformat(date_str.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid date format: {date_str!r} (expected YYYY-MM-DD)") from exc
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -128,15 +177,41 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Parse target month
-    try:
-        year, month = _parse_month(args.month)
-    except ValueError as exc:
-        logger.error("Invalid --month value: %s", exc)
-        sys.exit(1)
+    # Determine forecast mode: monthly or date-range
+    use_range_mode = args.from_date is not None
 
-    logger.info("=== MFC Forecast Generation ===")
-    logger.info("Target month : %04d-%02d", year, month)
+    year: int | None = None
+    month: int | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+
+    if use_range_mode:
+        # Date-range mode
+        try:
+            start_date = _parse_date(args.from_date)
+        except ValueError as exc:
+            logger.error("Invalid --from-date value: %s", exc)
+            sys.exit(1)
+
+        if args.days < 1:
+            logger.error("--days must be >= 1, got %d", args.days)
+            sys.exit(1)
+
+        end_date = start_date + timedelta(days=args.days - 1)
+
+        logger.info("=== MFC Forecast Generation (date range) ===")
+        logger.info("Date range   : %s .. %s (%d days)", start_date, end_date, args.days)
+    else:
+        # Monthly mode
+        try:
+            year, month = _parse_month(args.month)
+        except ValueError as exc:
+            logger.error("Invalid --month value: %s", exc)
+            sys.exit(1)
+
+        logger.info("=== MFC Forecast Generation ===")
+        logger.info("Target month : %04d-%02d", year, month)
+
     logger.info("Models dir   : %s", args.models_dir)
     logger.info("Database     : %s", args.db_url)
 
@@ -184,10 +259,22 @@ def main() -> None:
     if n_workers > 1 and len(branch_ids) > 1:
         results: dict[int, list | None] = {}
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(_generate_branch_forecast, bid, year, month, args.models_dir): bid
-                for bid in branch_ids
-            }
+            if use_range_mode:
+                futures = {
+                    pool.submit(
+                        _generate_branch_forecast_range, bid,
+                        start_date, end_date, args.models_dir,
+                    ): bid
+                    for bid in branch_ids
+                }
+            else:
+                futures = {
+                    pool.submit(
+                        _generate_branch_forecast, bid,
+                        year, month, args.models_dir,
+                    ): bid
+                    for bid in branch_ids
+                }
             for fut in as_completed(futures):
                 bid = futures[fut]
                 try:
@@ -210,12 +297,15 @@ def main() -> None:
         for idx, bid in enumerate(branch_ids, 1):
             logger.info("[%d/%d] Branch %d", idx, len(branch_ids), bid)
             try:
-                points = generate_forecast(bid, year, month, models)
+                if use_range_mode:
+                    points = generate_forecast_range(bid, start_date, end_date, models)
+                else:
+                    points = generate_forecast(bid, year, month, models)
             except Exception:
                 logger.exception("  Failed to generate forecast for branch %d", bid)
                 continue
             if not points:
-                logger.warning("  No forecast points generated (empty month?)")
+                logger.warning("  No forecast points generated (empty period?)")
                 continue
             saved = save_forecast_to_db(session, bid, points)
             total_points += saved

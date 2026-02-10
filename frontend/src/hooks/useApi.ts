@@ -37,7 +37,7 @@ export function useApi<T>(
   const execute = useCallback(() => {
     setState((prev) => ({ ...prev, loading: true, error: null }));
 
-    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 300));
+    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 150));
 
     Promise.all([fetcherRef.current(), minDelay])
       .then(([result]) => {

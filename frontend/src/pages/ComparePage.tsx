@@ -19,7 +19,7 @@ function formatWait(minutes: number): string {
 type MetricKey = 'visits' | 'wait' | 'windows';
 
 export default function ComparePage() {
-  const { selectedMonth, setPageTitle } = useLayoutContext();
+  const { dateRange, setPageTitle } = useLayoutContext();
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [metric, setMetric] = useState<MetricKey>('visits');
 
@@ -37,9 +37,9 @@ export default function ComparePage() {
   } = useApi<ComparisonResponse>(
     () =>
       selectedIds.length >= 2
-        ? api.compareBranches(selectedIds, selectedMonth)
-        : Promise.resolve({ month: selectedMonth, branches: [] }),
-    [selectedIds, selectedMonth]
+        ? api.compareBranches(selectedIds, dateRange.from, dateRange.to)
+        : Promise.resolve({ from_date: dateRange.from, to_date: dateRange.to, branches: [] }),
+    [selectedIds, dateRange.from, dateRange.to]
   );
 
   const toggleBranch = (id: number) => {
@@ -221,13 +221,7 @@ export default function ComparePage() {
                         <td className="px-4 py-2.5 text-[#0F172A]">
                           <span className="flex items-center gap-2">
                             <LoadIndicator
-                              value={
-                                (b.predicted_avg_wait ?? 0) > 20
-                                  ? 90
-                                  : (b.predicted_avg_wait ?? 0) > 10
-                                    ? 65
-                                    : 35
-                              }
+                              value={b.load_percent ?? 0}
                               size="sm"
                             />
                             {b.name}

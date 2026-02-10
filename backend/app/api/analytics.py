@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import calendar
+import math
 import re
-from datetime import date
+from datetime import date, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
@@ -22,6 +25,9 @@ from app.schemas import (
 router = APIRouter(tags=["analytics"])
 
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_DATE_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+_MAX_DATE_RANGE_DAYS = 60
 
 
 def _parse_month(month: str) -> tuple[int, int]:
@@ -34,10 +40,112 @@ def _parse_month(month: str) -> tuple[int, int]:
     return int(year), int(mon)
 
 
-def _month_date_range(year: int, month: int) -> tuple[date, date]:
-    start = date(year, month, 1)
-    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
-    return start, end
+def _parse_date(value: str, param_name: str) -> date:
+    """Validate and parse YYYY-MM-DD string into a date object."""
+    if not _DATE_RE.match(value):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {param_name} format: '{value}'. Expected YYYY-MM-DD.",
+        )
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {param_name} date: '{value}'.",
+        )
+
+
+def _resolve_date_range(
+    from_date: Optional[str],
+    to_date: Optional[str],
+    month: Optional[str],
+) -> tuple[date, date]:
+    """Resolve date range from query parameters.
+
+    Priority:
+    1. from_date / to_date  -- explicit date range
+    2. month                -- first/last day of the month
+    3. default              -- today + 30 days
+    """
+    if from_date is not None:
+        fd = _parse_date(from_date, "from_date")
+        if to_date is not None:
+            td = _parse_date(to_date, "to_date")
+        else:
+            td = fd + timedelta(days=30)
+        if td < fd:
+            raise HTTPException(
+                status_code=422,
+                detail="to_date must not be earlier than from_date.",
+            )
+        if (td - fd).days > _MAX_DATE_RANGE_DAYS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Date range must not exceed {_MAX_DATE_RANGE_DAYS} days.",
+            )
+        return fd, td
+
+    if month is not None:
+        year, mon = _parse_month(month)
+        fd = date(year, mon, 1)
+        last_day = calendar.monthrange(year, mon)[1]
+        td = date(year, mon, last_day)
+        return fd, td
+
+    # Default: today + 30 days
+    fd = date.today()
+    td = fd + timedelta(days=30)
+    return fd, td
+
+
+def _get_branch_avg_service_minutes(db: Session, branch_id: int) -> float:
+    """Get median avg_service_seconds from hourly_stats for a branch, convert to minutes.
+
+    Uses the percentile approach: fetch all non-null values, take the median.
+    Fallback: 15.0 minutes.
+    """
+    rows = (
+        db.query(HourlyStat.avg_service_seconds)
+        .filter(
+            HourlyStat.branch_id == branch_id,
+            HourlyStat.avg_service_seconds.isnot(None),
+            HourlyStat.avg_service_seconds > 0,
+        )
+        .order_by(HourlyStat.avg_service_seconds)
+        .all()
+    )
+    if not rows:
+        return 15.0
+    values = [float(r[0]) for r in rows]
+    n = len(values)
+    if n % 2 == 1:
+        median_sec = values[n // 2]
+    else:
+        median_sec = (values[n // 2 - 1] + values[n // 2]) / 2.0
+    return median_sec / 60.0
+
+
+def _compute_required_avg_windows_from_hourly(
+    hourly_visits_per_slot: dict[tuple, float],
+    avg_svc_minutes: float,
+) -> float:
+    """Compute required_avg_windows from per-(date, hour) predicted visits.
+
+    For each (date, hour) slot: required = ceil(visits * avg_svc_minutes / 60).
+    Return the average across all slots, rounded to 1 decimal.
+    """
+    if not hourly_visits_per_slot:
+        return 0.0
+    total_required = 0.0
+    count = 0
+    for _key, visits in hourly_visits_per_slot.items():
+        required = math.ceil(visits * avg_svc_minutes / 60.0)
+        total_required += required
+        count += 1
+    if count == 0:
+        return 0.0
+    return round(total_required / count, 1)
 
 
 # ---- Compare branches ----
@@ -46,7 +154,9 @@ def _month_date_range(year: int, month: int) -> tuple[date, date]:
 @router.get("/api/branches/compare", response_model=ComparisonResponse)
 def compare_branches(
     ids: str = Query(..., description="Comma-separated branch IDs (2-5)"),
-    month: str = Query(..., description="Month in YYYY-MM format"),
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Compare 2-5 branches side by side."""
@@ -58,8 +168,9 @@ def compare_branches(
     if len(branch_ids) < 2 or len(branch_ids) > 5:
         raise HTTPException(status_code=400, detail="Provide 2-5 branch IDs")
 
-    year, mon = _parse_month(month)
-    start, end = _month_date_range(year, mon)
+    fd, td = _resolve_date_range(from_date, to_date, month)
+    start = fd
+    end = td + timedelta(days=1)  # exclusive upper bound for < comparisons
 
     rows = []
     for bid in branch_ids:
@@ -80,17 +191,46 @@ def compare_branches(
 
         if forecasts:
             total_visits = sum(f.predicted_visits for f in forecasts)
-            avg_wait = (
-                sum(f.predicted_avg_wait for f in forecasts if f.predicted_avg_wait)
-                / max(1, sum(1 for f in forecasts if f.predicted_avg_wait))
-            )
+            wait_vals_f = [
+                f.predicted_avg_wait
+                for f in forecasts if f.predicted_avg_wait is not None
+            ]
+            avg_wait = (sum(wait_vals_f) / len(wait_vals_f)) if wait_vals_f else 0
             hourly_visits: dict[int, float] = {}
             for f in forecasts:
                 hourly_visits[f.hour] = hourly_visits.get(f.hour, 0) + f.predicted_visits
             peak_hour = max(hourly_visits, key=hourly_visits.get) if hourly_visits else None  # type: ignore[arg-type]
-            overloaded = sum(1 for f in forecasts if (f.predicted_avg_wait or 0) > 20)
+            overloaded = sum(
+                1 for f in forecasts
+                if (f.predicted_avg_wait or 0) > 20
+            )
 
-            avg_svc = None
+            # Get avg_service from historical hourly_stats (median, in minutes)
+            avg_svc = _get_branch_avg_service_minutes(db, bid)
+
+            # Compute required_avg_windows from per-(date, hour) forecast slots
+            hourly_slots: dict[tuple, float] = {}
+            for f in forecasts:
+                hourly_slots[(f.date, f.hour)] = f.predicted_visits
+            avg_svc_est = avg_svc if avg_svc else 15.0
+            required_avg_windows = _compute_required_avg_windows_from_hourly(
+                hourly_slots, avg_svc_est
+            )
+
+            # Compute load_percent from required_avg_windows vs avg available windows
+            avg_windows_available_row = (
+                db.query(func.avg(HourlyStat.num_windows_active))
+                .filter(
+                    HourlyStat.branch_id == bid,
+                    HourlyStat.num_windows_active > 0,
+                )
+                .scalar()
+            )
+            avg_windows_available = float(avg_windows_available_row) if avg_windows_available_row else 0.0
+            if avg_windows_available > 0:
+                load_percent = min(150.0, (required_avg_windows / avg_windows_available) * 100)
+            else:
+                load_percent = 0.0
         else:
             # Fallback to historical hourly_stats
             stats = (
@@ -124,13 +264,22 @@ def compare_branches(
                 1 for s in stats if s.avg_wait_seconds and s.avg_wait_seconds / 60.0 > 20
             )
 
-        # Rough required windows estimate
-        avg_svc_est = avg_svc if avg_svc else 15.0
-        num_days = len(set(f.date for f in forecasts)) if forecasts else 1
-        if num_days == 0:
-            num_days = 1
-        daily_visits = total_visits / num_days
-        required_avg_windows = round(daily_visits * avg_svc_est / (60.0 * 12), 1)
+            # Compute required_avg_windows from per-(date, hour) historical slots
+            avg_svc_est = avg_svc if avg_svc else 15.0
+            hourly_slots_h: dict[tuple, float] = {}
+            for s in stats:
+                hourly_slots_h[(s.date, s.hour)] = s.total_visits
+            required_avg_windows = _compute_required_avg_windows_from_hourly(
+                hourly_slots_h, avg_svc_est
+            )
+
+            # Compute load_percent from required_avg_windows vs avg available windows
+            windows_vals = [s.num_windows_active for s in stats if s.num_windows_active and s.num_windows_active > 0]
+            avg_windows_available = sum(windows_vals) / len(windows_vals) if windows_vals else 0.0
+            if avg_windows_available > 0:
+                load_percent = min(150.0, (required_avg_windows / avg_windows_available) * 100)
+            else:
+                load_percent = 0.0
 
         rows.append(
             {
@@ -142,10 +291,11 @@ def compare_branches(
                 "predicted_peak_hour": peak_hour,
                 "required_avg_windows": required_avg_windows,
                 "overloaded_hours_count": overloaded,
+                "load_percent": round(load_percent, 1),
             }
         )
 
-    return {"month": month, "branches": rows}
+    return {"from_date": fd.isoformat(), "to_date": td.isoformat(), "branches": rows}
 
 
 # ---- Overview ----
@@ -153,12 +303,15 @@ def compare_branches(
 
 @router.get("/api/analytics/overview", response_model=OverviewResponse)
 def get_overview(
-    month: str = Query(..., description="Month in YYYY-MM format"),
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format (backward compat)"),
+    from_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Return an overview of the entire MFC network for a given month."""
-    year, mon = _parse_month(month)
-    start, end = _month_date_range(year, mon)
+    """Return an overview of the entire MFC network for a given date range."""
+    fd, td = _resolve_date_range(from_date, to_date, month)
+    start = fd
+    end = td + timedelta(days=1)  # exclusive upper bound for < comparisons
 
     total_branches = db.query(func.count(Branch.id)).scalar() or 0
 
@@ -171,7 +324,10 @@ def get_overview(
 
     if forecasts:
         total_visits = sum(f.predicted_visits for f in forecasts)
-        wait_vals = [f.predicted_avg_wait for f in forecasts if f.predicted_avg_wait]
+        wait_vals = [
+            f.predicted_avg_wait
+            for f in forecasts if f.predicted_avg_wait is not None
+        ]
         avg_wait = (sum(wait_vals) / len(wait_vals)) if wait_vals else 0
 
         # Per-branch aggregation
@@ -187,7 +343,8 @@ def get_overview(
             bs = branch_stats[f.branch_id]
             bs["total_visits"] += f.predicted_visits
             if f.predicted_avg_wait is not None:
-                bs["wait_sum"] += f.predicted_avg_wait
+                clamped_wait = f.predicted_avg_wait
+                bs["wait_sum"] += clamped_wait
                 bs["wait_count"] += 1
             if (f.predicted_avg_wait or 0) > 20:
                 bs["overloaded_hours"] += 1
@@ -261,7 +418,8 @@ def get_overview(
         )
 
     return {
-        "month": month,
+        "from_date": fd.isoformat(),
+        "to_date": td.isoformat(),
         "total_branches": total_branches,
         "total_predicted_visits": round(total_visits, 1),
         "avg_predicted_wait": round(avg_wait, 1),

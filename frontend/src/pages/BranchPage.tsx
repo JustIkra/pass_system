@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useLayoutContext } from '../components/Layout';
 import { useApi } from '../hooks/useApi';
@@ -10,6 +10,7 @@ import HeatmapChart from '../components/HeatmapChart';
 import type {
   BranchDetail,
   ForecastResponse,
+  ForecastGenerationStatus,
   WindowsResponse,
   StaffingResponse,
   HistoryResponse,
@@ -32,7 +33,7 @@ type TabKey = 'forecast' | 'windows' | 'staffing' | 'history';
 export default function BranchPage() {
   const { id } = useParams<{ id: string }>();
   const branchId = Number(id);
-  const { selectedMonth, setPageTitle } = useLayoutContext();
+  const { dateRange, setPageTitle } = useLayoutContext();
   const [activeTab, setActiveTab] = useState<TabKey>('forecast');
 
   const { data: branch, loading: branchLoading } = useApi<BranchDetail>(
@@ -42,8 +43,8 @@ export default function BranchPage() {
 
   const { data: forecast, loading: forecastLoading, error: forecastError, refetch: refetchForecast } =
     useApi<ForecastResponse>(
-      () => api.getForecast(branchId, selectedMonth),
-      [branchId, selectedMonth]
+      () => api.getForecast(branchId, dateRange.from, dateRange.to),
+      [branchId, dateRange.from, dateRange.to]
     );
 
   useEffect(() => {
@@ -88,7 +89,7 @@ export default function BranchPage() {
       {/* KPI */}
       <div className="grid grid-cols-5 gap-4">
         <KpiCard
-          title="Обращений/мес (прогноз)"
+          title="Обращений за период (прогноз)"
           value={
             forecast
               ? formatNum(forecast.summary.total_predicted_visits)
@@ -108,12 +109,12 @@ export default function BranchPage() {
         <KpiCard
           title="Пиковый час"
           value={
-            forecast
+            forecast && forecast.summary.peak_hour != null
               ? `${forecast.summary.peak_hour}:00`
               : '-'
           }
           subtitle={
-            forecast ? `Пиковый день: ${forecast.summary.peak_day}` : undefined
+            forecast && forecast.summary.peak_day ? `Пиковый день: ${forecast.summary.peak_day}` : undefined
           }
         />
       </div>
@@ -144,13 +145,16 @@ export default function BranchPage() {
           loading={forecastLoading}
           error={forecastError}
           refetch={refetchForecast}
+          branchId={branchId}
+          fromDate={dateRange.from}
+          toDate={dateRange.to}
         />
       )}
       {activeTab === 'windows' && (
-        <WindowsTab branchId={branchId} month={selectedMonth} />
+        <WindowsTab branchId={branchId} fromDate={dateRange.from} toDate={dateRange.to} />
       )}
       {activeTab === 'staffing' && (
-        <StaffingTab branchId={branchId} month={selectedMonth} />
+        <StaffingTab branchId={branchId} fromDate={dateRange.from} toDate={dateRange.to} />
       )}
       {activeTab === 'history' && <HistoryTab branchId={branchId} />}
     </div>
@@ -164,67 +168,86 @@ function ForecastTab({
   loading,
   error,
   refetch,
+  branchId,
+  fromDate,
+  toDate,
 }: {
   forecast: ForecastResponse | null;
   loading: boolean;
   error: string | null;
   refetch: () => void;
+  branchId: number;
+  fromDate: string;
+  toDate: string;
 }) {
   if (loading) return <Spinner />;
   if (error) return <ErrorBlock message={error} onRetry={refetch} />;
-  if (!forecast || forecast.data.length === 0) return <EmptyForecast />;
-
-  // Aggregate by day for line chart
-  const dailyMap = new Map<string, { value: number; lower: number; upper: number }>();
-  for (const p of forecast.data) {
-    const existing = dailyMap.get(p.date);
-    if (existing) {
-      existing.value += p.predicted_visits;
-      existing.lower += p.confidence_lower;
-      existing.upper += p.confidence_upper;
-    } else {
-      dailyMap.set(p.date, {
-        value: p.predicted_visits,
-        lower: p.confidence_lower,
-        upper: p.confidence_upper,
-      });
-    }
+  if (!forecast || forecast.data.length === 0) {
+    return (
+      <BranchForecastGenPanel
+        branchId={branchId}
+        fromDate={fromDate}
+        toDate={toDate}
+        onComplete={refetch}
+      />
+    );
   }
 
-  const lineData = Array.from(dailyMap.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, vals]) => ({
-      date,
-      value: Math.round(vals.value),
-      lower: Math.round(vals.lower),
-      upper: Math.round(vals.upper),
-    }));
+  return <ForecastCharts forecast={forecast} />;
+}
 
-  // Aggregate for heatmap (day of week x hour)
-  const heatmapAgg = new Map<string, { total: number; count: number }>();
-  for (const p of forecast.data) {
-    const d = new Date(p.date);
-    const dow = d.getDay(); // 0=Sun, 1=Mon...
-    const dayIdx = dow === 0 ? 5 : dow - 1; // Map to 0=Mon, 5=Sat (skip Sun)
-    if (dow === 0) continue; // skip Sundays
-    const key = `${dayIdx}-${p.hour}`;
-    const existing = heatmapAgg.get(key);
-    if (existing) {
-      existing.total += p.predicted_visits;
-      existing.count += 1;
-    } else {
-      heatmapAgg.set(key, { total: p.predicted_visits, count: 1 });
+function ForecastCharts({ forecast }: { forecast: ForecastResponse }) {
+  const lineData = useMemo(() => {
+    const dailyMap = new Map<string, { value: number; lower: number; upper: number }>();
+    for (const p of forecast.data) {
+      const existing = dailyMap.get(p.date);
+      if (existing) {
+        existing.value += p.predicted_visits;
+        existing.lower += p.confidence_lower ?? 0;
+        existing.upper += p.confidence_upper ?? 0;
+      } else {
+        dailyMap.set(p.date, {
+          value: p.predicted_visits,
+          lower: p.confidence_lower ?? 0,
+          upper: p.confidence_upper ?? 0,
+        });
+      }
     }
-  }
+    return Array.from(dailyMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, vals]) => ({
+        date,
+        value: Math.round(vals.value),
+        lower: Math.round(vals.lower),
+        upper: Math.round(vals.upper),
+      }));
+  }, [forecast]);
 
-  const heatmapData = Array.from(heatmapAgg.entries()).map(([key, vals]) => {
-    const [dow, hour] = key.split('-').map(Number);
-    return {
-      dayOfWeek: dow ?? 0,
-      hour: hour ?? 8,
-      value: vals.count > 0 ? vals.total / vals.count : 0,
-    };
-  });
+  const heatmapData = useMemo(() => {
+    const heatmapAgg = new Map<string, { total: number; count: number }>();
+    for (const p of forecast.data) {
+      const d = new Date(p.date);
+      const dow = d.getDay();
+      const dayIdx = dow === 0 ? 5 : dow - 1;
+      if (dow === 0) continue;
+      const key = `${dayIdx}-${p.hour}`;
+      const existing = heatmapAgg.get(key);
+      if (existing) {
+        existing.total += p.predicted_visits;
+        existing.count += 1;
+      } else {
+        heatmapAgg.set(key, { total: p.predicted_visits, count: 1 });
+      }
+    }
+    return Array.from(heatmapAgg.entries()).map(([key, vals]) => {
+      const [dow, hour] = key.split('-').map(Number);
+      return {
+        dayOfWeek: dow ?? 0,
+        hour: hour ?? 8,
+        value: vals.count > 0 ? vals.total / vals.count : 0,
+      };
+    });
+  }, [forecast]);
 
   return (
     <div className="space-y-6">
@@ -245,14 +268,16 @@ function ForecastTab({
 
 function WindowsTab({
   branchId,
-  month,
+  fromDate,
+  toDate,
 }: {
   branchId: number;
-  month: string;
+  fromDate: string;
+  toDate: string;
 }) {
   const { data, loading, error, refetch } = useApi<WindowsResponse>(
-    () => api.getWindows(branchId, month),
-    [branchId, month]
+    () => api.getWindows(branchId, fromDate, toDate),
+    [branchId, fromDate, toDate]
   );
 
   if (loading) return <Spinner />;
@@ -277,6 +302,16 @@ function WindowsTab({
   };
 
   return (
+    <div className="space-y-3">
+      {data.data_source === 'forecast' ? (
+        <span className="inline-flex items-center rounded-md border border-blue-200 bg-blue-50 px-3 py-1.5 text-sm text-blue-600">
+          Прогнозные данные
+        </span>
+      ) : (
+        <span className="inline-flex items-center rounded-md border border-green-200 bg-green-50 px-3 py-1.5 text-sm text-green-600">
+          Фактические данные
+        </span>
+      )}
     <div className="bg-white rounded-lg border border-[#E2E8F0] overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
@@ -387,6 +422,7 @@ function WindowsTab({
         </span>
       </div>
     </div>
+    </div>
   );
 }
 
@@ -394,19 +430,27 @@ function WindowsTab({
 
 function StaffingTab({
   branchId,
-  month,
+  fromDate,
+  toDate,
 }: {
   branchId: number;
-  month: string;
+  fromDate: string;
+  toDate: string;
 }) {
   const { data, loading, error, refetch } = useApi<StaffingResponse>(
-    () => api.getStaffing(branchId, month),
-    [branchId, month]
+    () => api.getStaffing(branchId, fromDate, toDate),
+    [branchId, fromDate, toDate]
   );
 
   if (loading) return <Spinner />;
   if (error) return <ErrorBlock message={error} onRetry={refetch} />;
-  if (!data || data.recommendations.length === 0) return <EmptyForecast />;
+  if (!data || data.recommendations.length === 0) {
+    return (
+      <div className="text-center text-[#64748B] py-12">
+        Нет данных по штатному расписанию. Сначала сгенерируйте прогноз.
+      </div>
+    );
+  }
 
   // Group by date
   const dateMap = new Map<
@@ -702,17 +746,110 @@ function ErrorBlock({
   );
 }
 
-function EmptyForecast() {
+function BranchForecastGenPanel({
+  branchId,
+  fromDate,
+  toDate,
+  onComplete,
+}: {
+  branchId: number;
+  fromDate: string;
+  toDate: string;
+  onComplete: () => void;
+}) {
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [genStatus, setGenStatus] = useState<ForecastGenerationStatus | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return stopPolling;
+  }, [stopPolling]);
+
+  const handleGenerate = async () => {
+    setStarting(true);
+    setError(null);
+    try {
+      await api.generateForecast({
+        from_date: fromDate,
+        to_date: toDate,
+        branch_id: branchId,
+      });
+      setGenStatus({
+        status: 'running',
+        progress: 0,
+        total_branches: 1,
+        current_branch_name: null,
+        started_at: new Date().toISOString(),
+        error_message: null,
+      });
+      intervalRef.current = setInterval(async () => {
+        try {
+          const s = await api.getForecastGenerationStatus();
+          setGenStatus(s);
+          if (s.status === 'completed' || s.status === 'error') {
+            stopPolling();
+            if (s.status === 'completed') {
+              onComplete();
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка запуска генерации');
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const isRunning = genStatus?.status === 'running';
+  const hasError = genStatus?.status === 'error';
+
   return (
     <div className="flex items-center justify-center h-48">
-      <div className="text-center text-[#64748B]">
-        <p className="text-lg mb-2">Прогноз не сгенерирован</p>
-        <p className="text-sm">
-          Запустите скрипт{' '}
-          <code className="bg-[#F1F5F9] px-2 py-0.5 rounded text-[#0F172A]">
-            generate_forecast.py
-          </code>
-        </p>
+      <div className="text-center">
+        {!genStatus || genStatus.status === 'idle' ? (
+          <>
+            <p className="text-lg mb-2 text-[#64748B]">Прогноз не сгенерирован</p>
+            <p className="text-sm text-[#64748B] mb-4">
+              Нажмите кнопку для генерации прогноза этого филиала
+            </p>
+            <button
+              onClick={handleGenerate}
+              disabled={starting}
+              className="px-5 py-2.5 bg-[#2563EB] text-white rounded-lg text-sm font-medium hover:bg-[#1D4ED8] disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {starting ? 'Запуск...' : 'Сгенерировать прогноз'}
+            </button>
+            {error && <p className="text-[#EF4444] text-sm mt-3">{error}</p>}
+          </>
+        ) : isRunning ? (
+          <>
+            <div className="w-8 h-8 border-3 border-[#2563EB] border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+            <p className="text-sm font-medium text-[#0F172A]">
+              Генерация прогноза...
+            </p>
+          </>
+        ) : hasError ? (
+          <>
+            <p className="text-[#EF4444] mb-3">{genStatus.error_message}</p>
+            <button
+              onClick={handleGenerate}
+              className="px-5 py-2.5 bg-[#2563EB] text-white rounded-lg text-sm font-medium hover:bg-[#1D4ED8]"
+            >
+              Повторить
+            </button>
+          </>
+        ) : null}
       </div>
     </div>
   );

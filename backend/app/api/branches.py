@@ -100,7 +100,7 @@ def get_branch(branch_id: int, db: Session = Depends(get_db)) -> dict:
         )
         .scalar()
     )
-    avg_wait_minutes = round(avg_wait_sec / 60.0, 1) if avg_wait_sec else 0
+    avg_wait_minutes = round(float(avg_wait_sec) / 60.0, 1) if avg_wait_sec else 0
 
     avg_svc_sec = (
         db.query(func.avg(QueueRecord.service_seconds))
@@ -110,7 +110,7 @@ def get_branch(branch_id: int, db: Session = Depends(get_db)) -> dict:
         )
         .scalar()
     )
-    avg_service_minutes = round(avg_svc_sec / 60.0, 1) if avg_svc_sec else 0
+    avg_service_minutes = round(float(avg_svc_sec) / 60.0, 1) if avg_svc_sec else 0
 
     # Top services
     top_services_rows = (
@@ -134,11 +134,24 @@ def get_branch(branch_id: int, db: Session = Depends(get_db)) -> dict:
         for r in top_services_rows
     ]
 
+    # Date range from queue records
+    date_stats = (
+        db.query(
+            func.min(QueueRecord.registered_at),
+            func.max(QueueRecord.registered_at),
+        )
+        .filter(QueueRecord.branch_id == branch_id)
+        .first()
+    )
+    from_date = date_stats[0].strftime("%Y-%m-%d") if date_stats and date_stats[0] else None
+    to_date = date_stats[1].strftime("%Y-%m-%d") if date_stats and date_stats[1] else None
+
     return {
         "id": branch.id,
         "name": branch.name,
         "depart_name_mfc": branch.depart_name_mfc,
         "total_records": total_records,
+        "date_range": {"from_date": from_date, "to_date": to_date},
         "num_employees": num_employees,
         "num_windows": num_windows,
         "avg_daily_visits": avg_daily_visits,
