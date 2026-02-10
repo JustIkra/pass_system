@@ -63,21 +63,18 @@ def get_historical_bounds(db: Session, branch_id: int, confidence: float = 3.0) 
     Returns:
         (lower_bound, upper_bound)
     """
-    from sqlalchemy import func
-
-    stats = db.query(
-        func.avg(HourlyStat.total_visits).label('mean'),
-        func.stddev(HourlyStat.total_visits).label('std')
-    ).filter(
+    # SQLite doesn't support stddev, so we compute it manually
+    visits = db.query(HourlyStat.total_visits).filter(
         HourlyStat.branch_id == branch_id,
         HourlyStat.total_visits > 0
-    ).first()
+    ).all()
 
-    if not stats or not stats.mean:
+    if not visits:
         return (0, 100)
 
-    mean = stats.mean
-    std = stats.std if stats.std else mean * 0.5
+    values = np.array([v[0] for v in visits])
+    mean = np.mean(values)
+    std = np.std(values) if len(values) > 1 else mean * 0.5
 
     lower = max(0, mean - confidence * std)
     upper = mean + confidence * std
@@ -97,22 +94,19 @@ def get_hourly_bounds(db: Session, branch_id: int, hour: int) -> tuple:
     Returns:
         (lower_bound, upper_bound)
     """
-    from sqlalchemy import func
-
-    stats = db.query(
-        func.avg(HourlyStat.total_visits).label('mean'),
-        func.stddev(HourlyStat.total_visits).label('std')
-    ).filter(
+    # SQLite doesn't support stddev, so we compute it manually
+    visits = db.query(HourlyStat.total_visits).filter(
         HourlyStat.branch_id == branch_id,
         HourlyStat.hour == hour,
         HourlyStat.total_visits > 0
-    ).first()
+    ).all()
 
-    if not stats or not stats.mean:
+    if not visits:
         return get_historical_bounds(db, branch_id)
 
-    mean = stats.mean
-    std = stats.std if stats.std else mean * 0.5
+    values = np.array([v[0] for v in visits])
+    mean = np.mean(values)
+    std = np.std(values) if len(values) > 1 else mean * 0.5
 
     # Для почасовых паттернов используем более строгие границы (2.5σ)
     lower = max(0, mean - 2.5 * std)

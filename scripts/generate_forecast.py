@@ -57,35 +57,67 @@ logger = logging.getLogger("generate_forecast")
 
 
 def _generate_branch_forecast(
-    bid: int, year: int, month: int, models_dir: str,
+    bid: int, year: int, month: int, models_dir: str, db_url: str,
 ) -> tuple[int, list | None]:
     """Generate forecast for a single branch in a worker process."""
     from app.ml.prediction import generate_forecast, load_models
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
     models = load_models(models_dir)
     if bid not in models:
         return bid, None
+
+    # Create DB session for postprocessing
+    connect_args = {}
+    if "sqlite" in db_url:
+        connect_args = {"check_same_thread": False}
+    engine = create_engine(db_url, connect_args=connect_args, echo=False)
+    Session = sessionmaker(bind=engine)
+    db_session = Session()
+
     try:
-        points = generate_forecast(bid, year, month, models)
+        points = generate_forecast(
+            bid, year, month, models,
+            apply_postprocessing=True, db_session=db_session
+        )
         return bid, points
     except Exception:
         return bid, None
+    finally:
+        db_session.close()
 
 
 def _generate_branch_forecast_range(
-    bid: int, start_date: date, end_date: date, models_dir: str,
+    bid: int, start_date: date, end_date: date, models_dir: str, db_url: str,
 ) -> tuple[int, list | None]:
     """Generate forecast for a single branch over a date range in a worker process."""
     from app.ml.prediction import generate_forecast_range, load_models
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
     models = load_models(models_dir)
     if bid not in models:
         return bid, None
+
+    # Create DB session for postprocessing
+    connect_args = {}
+    if "sqlite" in db_url:
+        connect_args = {"check_same_thread": False}
+    engine = create_engine(db_url, connect_args=connect_args, echo=False)
+    Session = sessionmaker(bind=engine)
+    db_session = Session()
+
     try:
-        points = generate_forecast_range(bid, start_date, end_date, models)
+        points = generate_forecast_range(
+            bid, start_date, end_date, models,
+            apply_postprocessing=True, db_session=db_session
+        )
         return bid, points
     except Exception:
         return bid, None
+    finally:
+        db_session.close()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -263,7 +295,7 @@ def main() -> None:
                 futures = {
                     pool.submit(
                         _generate_branch_forecast_range, bid,
-                        start_date, end_date, args.models_dir,
+                        start_date, end_date, args.models_dir, args.db_url,
                     ): bid
                     for bid in branch_ids
                 }
@@ -271,7 +303,7 @@ def main() -> None:
                 futures = {
                     pool.submit(
                         _generate_branch_forecast, bid,
-                        year, month, args.models_dir,
+                        year, month, args.models_dir, args.db_url,
                     ): bid
                     for bid in branch_ids
                 }
@@ -298,9 +330,15 @@ def main() -> None:
             logger.info("[%d/%d] Branch %d", idx, len(branch_ids), bid)
             try:
                 if use_range_mode:
-                    points = generate_forecast_range(bid, start_date, end_date, models)
+                    points = generate_forecast_range(
+                        bid, start_date, end_date, models,
+                        apply_postprocessing=True, db_session=session
+                    )
                 else:
-                    points = generate_forecast(bid, year, month, models)
+                    points = generate_forecast(
+                        bid, year, month, models,
+                        apply_postprocessing=True, db_session=session
+                    )
             except Exception:
                 logger.exception("  Failed to generate forecast for branch %d", bid)
                 continue

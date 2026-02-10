@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.ml.utils import REGRESSOR_COLUMNS, add_regressors, is_russian_holiday
+from app.ml.postprocessing import postprocess_forecast
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,8 @@ def generate_forecast(
     year: int,
     month: int,
     models: dict[int, tuple[Prophet, Prophet]],
+    apply_postprocessing: bool = True,
+    db_session: Session | None = None,
 ) -> list[ForecastPoint]:
     """Generate an hourly forecast for *branch_id* over *year*-*month*.
 
@@ -202,6 +205,11 @@ def generate_forecast(
         Target period.
     models:
         Pre-loaded model dictionary (see :func:`load_models`).
+    apply_postprocessing:
+        If ``True`` (default), applies capacity constraints and smoothing to the forecast.
+    db_session:
+        Optional DB session for postprocessing metadata queries. Required if
+        ``apply_postprocessing=True``.
 
     Returns
     -------
@@ -212,6 +220,8 @@ def generate_forecast(
     ------
     KeyError
         If *branch_id* is not found in *models*.
+    ValueError
+        If ``apply_postprocessing=True`` and ``db_session`` is ``None``.
     """
     if branch_id not in models:
         raise KeyError(f"No trained model for branch_id={branch_id}")
@@ -248,17 +258,46 @@ def generate_forecast(
     wait_fc["yhat_lower"] = wait_fc["yhat_lower"].clip(upper=model_log_cap)
     wait_fc["yhat_upper"] = wait_fc["yhat_upper"].clip(upper=model_log_cap)
 
+    # Inverse log1p transform (models trained on log-scale)
+    visits_fc["predicted_visits"] = np.maximum(np.expm1(visits_fc["yhat"].values), 0.0)
+    visits_fc["confidence_lower"] = np.maximum(np.expm1(visits_fc["yhat_lower"].values), 0.0)
+    visits_fc["confidence_upper"] = np.maximum(np.expm1(visits_fc["yhat_upper"].values), 0.0)
+    wait_fc["predicted_avg_wait"] = np.maximum(np.expm1(wait_fc["yhat"].values), 0.0)
+
+    # Extract date and hour for postprocessing
+    visits_fc["date"] = visits_fc["ds"].dt.strftime("%Y-%m-%d")
+    visits_fc["hour"] = visits_fc["ds"].dt.hour
+
+    # Apply postprocessing if requested
+    if apply_postprocessing:
+        if db_session is None:
+            raise ValueError(
+                "apply_postprocessing=True requires db_session parameter"
+            )
+        # Create DataFrame compatible with postprocess_forecast
+        forecast_df = pd.DataFrame({
+            "date": visits_fc["date"],
+            "hour": visits_fc["hour"],
+            "predicted_visits": visits_fc["predicted_visits"],
+        })
+        forecast_df = postprocess_forecast(
+            forecast_df, branch_id, db_session,
+            apply_smoothing=True, correct_outliers=True
+        )
+        # Update with postprocessed values
+        visits_fc["predicted_visits"] = forecast_df["predicted_visits"].values
+
+    # Build ForecastPoint objects
     points: list[ForecastPoint] = []
     for i in range(len(visits_fc)):
         row_v = visits_fc.iloc[i]
         row_w = wait_fc.iloc[i]
         ds: pd.Timestamp = row_v["ds"]
 
-        # Inverse log1p transform (models trained on log-scale)
-        predicted_visits = max(0.0, round(float(np.expm1(row_v["yhat"])), 1))
-        predicted_avg_wait = max(0.0, round(float(np.expm1(row_w["yhat"])), 1))
-        confidence_lower = max(0.0, round(float(np.expm1(row_v["yhat_lower"])), 1))
-        confidence_upper = max(0.0, round(float(np.expm1(row_v["yhat_upper"])), 1))
+        predicted_visits = max(0.0, round(float(row_v["predicted_visits"]), 1))
+        predicted_avg_wait = max(0.0, round(float(row_w["predicted_avg_wait"]), 1))
+        confidence_lower = max(0.0, round(float(row_v["confidence_lower"]), 1))
+        confidence_upper = max(0.0, round(float(row_v["confidence_upper"]), 1))
 
         points.append(
             ForecastPoint(
@@ -272,8 +311,9 @@ def generate_forecast(
         )
 
     logger.info(
-        "Generated %d forecast points for branch %d (%d-%02d)",
+        "Generated %d forecast points for branch %d (%d-%02d)%s",
         len(points), branch_id, year, month,
+        " [postprocessed]" if apply_postprocessing else "",
     )
     return points
 
@@ -283,6 +323,8 @@ def generate_forecast_range(
     start_date: date,
     end_date: date,
     models: dict[int, tuple[Prophet, Prophet]],
+    apply_postprocessing: bool = True,
+    db_session: Session | None = None,
 ) -> list[ForecastPoint]:
     """Generate an hourly forecast for *branch_id* over an arbitrary date range.
 
@@ -294,6 +336,11 @@ def generate_forecast_range(
         Inclusive date boundaries for the forecast period.
     models:
         Pre-loaded model dictionary (see :func:`load_models`).
+    apply_postprocessing:
+        If ``True`` (default), applies capacity constraints and smoothing to the forecast.
+    db_session:
+        Optional DB session for postprocessing metadata queries. Required if
+        ``apply_postprocessing=True``.
 
     Returns
     -------
@@ -305,7 +352,8 @@ def generate_forecast_range(
     KeyError
         If *branch_id* is not found in *models*.
     ValueError
-        If *start_date* > *end_date*.
+        If *start_date* > *end_date* or if ``apply_postprocessing=True``
+        and ``db_session`` is ``None``.
     """
     if start_date > end_date:
         raise ValueError(
@@ -348,17 +396,46 @@ def generate_forecast_range(
     wait_fc["yhat_lower"] = wait_fc["yhat_lower"].clip(upper=model_log_cap)
     wait_fc["yhat_upper"] = wait_fc["yhat_upper"].clip(upper=model_log_cap)
 
+    # Inverse log1p transform (models trained on log-scale)
+    visits_fc["predicted_visits"] = np.maximum(np.expm1(visits_fc["yhat"].values), 0.0)
+    visits_fc["confidence_lower"] = np.maximum(np.expm1(visits_fc["yhat_lower"].values), 0.0)
+    visits_fc["confidence_upper"] = np.maximum(np.expm1(visits_fc["yhat_upper"].values), 0.0)
+    wait_fc["predicted_avg_wait"] = np.maximum(np.expm1(wait_fc["yhat"].values), 0.0)
+
+    # Extract date and hour for postprocessing
+    visits_fc["date"] = visits_fc["ds"].dt.strftime("%Y-%m-%d")
+    visits_fc["hour"] = visits_fc["ds"].dt.hour
+
+    # Apply postprocessing if requested
+    if apply_postprocessing:
+        if db_session is None:
+            raise ValueError(
+                "apply_postprocessing=True requires db_session parameter"
+            )
+        # Create DataFrame compatible with postprocess_forecast
+        forecast_df = pd.DataFrame({
+            "date": visits_fc["date"],
+            "hour": visits_fc["hour"],
+            "predicted_visits": visits_fc["predicted_visits"],
+        })
+        forecast_df = postprocess_forecast(
+            forecast_df, branch_id, db_session,
+            apply_smoothing=True, correct_outliers=True
+        )
+        # Update with postprocessed values
+        visits_fc["predicted_visits"] = forecast_df["predicted_visits"].values
+
+    # Build ForecastPoint objects
     points: list[ForecastPoint] = []
     for i in range(len(visits_fc)):
         row_v = visits_fc.iloc[i]
         row_w = wait_fc.iloc[i]
         ds: pd.Timestamp = row_v["ds"]
 
-        # Inverse log1p transform (models trained on log-scale)
-        predicted_visits = max(0.0, round(float(np.expm1(row_v["yhat"])), 1))
-        predicted_avg_wait = max(0.0, round(float(np.expm1(row_w["yhat"])), 1))
-        confidence_lower = max(0.0, round(float(np.expm1(row_v["yhat_lower"])), 1))
-        confidence_upper = max(0.0, round(float(np.expm1(row_v["yhat_upper"])), 1))
+        predicted_visits = max(0.0, round(float(row_v["predicted_visits"]), 1))
+        predicted_avg_wait = max(0.0, round(float(row_w["predicted_avg_wait"]), 1))
+        confidence_lower = max(0.0, round(float(row_v["confidence_lower"]), 1))
+        confidence_upper = max(0.0, round(float(row_v["confidence_upper"]), 1))
 
         points.append(
             ForecastPoint(
@@ -372,8 +449,9 @@ def generate_forecast_range(
         )
 
     logger.info(
-        "Generated %d forecast points for branch %d (%s .. %s)",
+        "Generated %d forecast points for branch %d (%s .. %s)%s",
         len(points), branch_id, start_date, end_date,
+        " [postprocessed]" if apply_postprocessing else "",
     )
     return points
 
