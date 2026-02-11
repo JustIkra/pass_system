@@ -7,6 +7,7 @@ import KpiCard from '../components/KpiCard';
 import LoadIndicator, { getLoadBgClass } from '../components/LoadIndicator';
 import LineChart from '../components/LineChart';
 import HeatmapChart from '../components/HeatmapChart';
+import { QualityIndicator } from '../components/QualityIndicator';
 import type {
   BranchDetail,
   ForecastResponse,
@@ -197,6 +198,8 @@ function ForecastTab({
 }
 
 function ForecastCharts({ forecast }: { forecast: ForecastResponse }) {
+  const hasLowQuality = forecast.quality_metrics && forecast.quality_metrics.wMAPE > 25;
+
   const lineData = useMemo(() => {
     const dailyMap = new Map<string, { value: number; lower: number; upper: number }>();
     for (const p of forecast.data) {
@@ -251,6 +254,15 @@ function ForecastCharts({ forecast }: { forecast: ForecastResponse }) {
 
   return (
     <div className="space-y-6">
+      {/* Quality indicator - показываем детальный для low quality */}
+      {hasLowQuality ? (
+        <QualityIndicator metrics={forecast.quality_metrics} variant="detailed" />
+      ) : (
+        forecast.quality_metrics && (
+          <QualityIndicator metrics={forecast.quality_metrics} variant="inline" />
+        )
+      )}
+
       <LineChart
         data={lineData}
         title="Прогноз обращений по дням"

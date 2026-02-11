@@ -29,6 +29,7 @@ from app.schemas import (
 from app.services.forecast_service import (
     compute_forecast_summary,
     get_forecast_data,
+    get_quality_metrics,
     get_staffing_recommendations,
     get_window_stats,
 )
@@ -136,6 +137,7 @@ def get_forecast(
 
     data = get_forecast_data(db, branch_id, fd, td)
     summary = compute_forecast_summary(data)
+    quality = get_quality_metrics(db, branch_id)
 
     return {
         "branch_id": branch.id,
@@ -144,6 +146,7 @@ def get_forecast(
         "to_date": td.isoformat(),
         "data": data,
         "summary": summary,
+        "quality_metrics": quality,
     }
 
 

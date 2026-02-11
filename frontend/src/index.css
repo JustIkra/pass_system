@@ -105,3 +105,72 @@ th {
   transition-duration: 200ms;
   transition-timing-function: ease;
 }
+
+/* ===== Quality Indicator Styles ===== */
+
+/* Badge colors - синяя-фиолетовая-серая палитра */
+.quality-high {
+  background-color: #DBEAFE; /* bg-blue-100 */
+  color: #1E40AF;            /* text-blue-800 */
+  border: 1px solid #3B82F6;
+}
+
+.quality-medium {
+  background-color: #EDE9FE; /* bg-purple-100 */
+  color: #6B21A8;            /* text-purple-800 */
+  border: 1px solid #8B5CF6;
+}
+
+.quality-low {
+  background-color: #F3F4F6; /* bg-gray-100 */
+  color: #374151;            /* text-gray-700 */
+  border: 1px solid #9CA3AF;
+}
+
+.quality-unavailable {
+  background-color: #F9FAFB; /* bg-gray-50 */
+  color: #9CA3AF;            /* text-gray-400 */
+  border: 1px solid #D1D5DB;
+}
+
+/* Text colors for inline display */
+.quality-high-text { color: #1E40AF; }
+.quality-medium-text { color: #6B21A8; }
+.quality-low-text { color: #374151; }
+
+/* Quality badge base styles */
+.quality-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: help;
+  transition: all 0.2s ease;
+}
+
+.quality-badge:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Info panel for low quality */
+.quality-info-panel {
+  background-color: #EFF6FF; /* bg-blue-50 */
+  border-left: 4px solid #3B82F6;
+  color: #1E3A8A; /* text-blue-900 */
+  padding: 1rem;
+  border-radius: 0.375rem;
+  margin-bottom: 1rem;
+}
+
+.quality-info-panel ul {
+  margin: 0.5rem 0 0 1.5rem;
+  list-style-type: disc;
+}
+
+.quality-info-panel li {
+  margin: 0.25rem 0;
+}

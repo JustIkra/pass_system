@@ -1,5 +1,13 @@
 // === Базовые типы ===
 
+export interface QualityMetrics {
+  wMAPE: number;
+  confidence: number; // 0-100%
+  training_days: number;
+  last_updated: string;
+  recommendations?: string[];
+}
+
 export interface Branch {
   id: number;
   name: string;
@@ -48,6 +56,7 @@ export interface ForecastResponse {
   to_date: string;
   data: ForecastPoint[];
   summary: ForecastSummary;
+  quality_metrics?: QualityMetrics;
 }
 
 // === Загрузка окон ===

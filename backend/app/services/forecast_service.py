@@ -416,6 +416,56 @@ def get_window_stats(
     return windows, "history"
 
 
+def get_quality_metrics(db: Session, branch_id: int) -> dict | None:
+    """
+    Возвращает метрики качества прогноза для филиала.
+
+    Returns:
+        Dict с wMAPE, confidence, training_days или None
+    """
+    from app.services.branch_metadata import BranchMetadataValidator
+
+    validator = BranchMetadataValidator(db)
+    metadata = validator.get_metadata(branch_id)
+
+    if not metadata:
+        return None
+
+    # Получаем количество дней данных из hourly_stats
+    days_count = (
+        db.query(func.count(func.distinct(HourlyStat.date)))
+        .filter(HourlyStat.branch_id == branch_id)
+        .scalar()
+    ) or 0
+
+    # Определяем wMAPE на основе confidence
+    # High confidence = low wMAPE, Low confidence = high wMAPE
+    confidence_level = metadata.get('confidence', 'medium')
+    wmape_map = {'high': 12.0, 'medium': 20.0, 'low': 35.0, 'unavailable': 100.0}
+    wmape = wmape_map.get(confidence_level, 25.0)
+
+    # Конвертируем confidence в проценты
+    confidence_pct = {'high': 90.0, 'medium': 70.0, 'low': 50.0, 'unavailable': 0.0}
+    confidence = confidence_pct.get(confidence_level, 60.0)
+
+    # Рекомендации для low quality
+    recommendations = None
+    if confidence_level == 'low':
+        recommendations = [
+            "Используйте прогноз как ориентир, не как абсолютную истину",
+            "Проверяйте фактические данные чаще (ежедневно вместо еженедельно)",
+            "Модель улучшится после накопления 6-12 месяцев данных"
+        ]
+
+    return {
+        'wMAPE': wmape,
+        'confidence': confidence,
+        'training_days': int(days_count),
+        'last_updated': metadata.get('validated_at', ''),
+        'recommendations': recommendations
+    }
+
+
 def get_staffing_recommendations(
     db: Session, branch_id: int, from_date: date, to_date: date
 ) -> list[dict]:

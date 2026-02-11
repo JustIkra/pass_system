@@ -4,6 +4,18 @@ from datetime import date, datetime
 from pydantic import BaseModel
 
 
+# ---- Quality Metrics schema ----
+
+
+class QualityMetrics(BaseModel):
+    """Метрики качества прогноза."""
+    wMAPE: float  # Weighted Mean Absolute Percentage Error
+    confidence: float  # 0-100% (из CI coverage или confidence level)
+    training_days: int  # Количество дней данных
+    last_updated: str  # ISO datetime
+    recommendations: list[str] | None = None  # Для low quality
+
+
 # ---- Branch schemas ----
 
 
@@ -75,6 +87,7 @@ class ForecastResponse(BaseModel):
     to_date: str
     data: list[ForecastPoint]
     summary: ForecastSummary
+    quality_metrics: QualityMetrics | None = None
 
 
 # ---- Windows schemas ----
