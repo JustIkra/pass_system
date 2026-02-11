@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Branch, Forecast, HourlyStat
+from app.services.forecast_service import get_valid_branch_ids
 from app.schemas import (
     ComparisonResponse,
     ComparisonRow,
@@ -172,8 +173,11 @@ def compare_branches(
     start = fd
     end = td + timedelta(days=1)  # exclusive upper bound for < comparisons
 
+    valid_ids = get_valid_branch_ids()
     rows = []
     for bid in branch_ids:
+        if bid not in valid_ids:
+            continue
         branch = db.get(Branch, bid)
         if not branch:
             continue
@@ -313,14 +317,14 @@ def get_overview(
     start = fd
     end = td + timedelta(days=1)  # exclusive upper bound for < comparisons
 
-    total_branches = db.query(func.count(Branch.id)).scalar() or 0
+    valid_ids = get_valid_branch_ids()
+    total_branches = len(valid_ids) if valid_ids else 0
 
-    # Try forecast data
-    forecasts = (
-        db.query(Forecast)
-        .filter(Forecast.date >= start, Forecast.date < end)
-        .all()
-    )
+    # Try forecast data (only validated branches)
+    q = db.query(Forecast).filter(Forecast.date >= start, Forecast.date < end)
+    if valid_ids:
+        q = q.filter(Forecast.branch_id.in_(valid_ids))
+    forecasts = q.all()
 
     if forecasts:
         total_visits = sum(f.predicted_visits for f in forecasts)
@@ -349,14 +353,16 @@ def get_overview(
             if (f.predicted_avg_wait or 0) > 20:
                 bs["overloaded_hours"] += 1
     else:
-        # Fallback to hourly_stats
-        stats = (
-            db.query(HourlyStat)
-            .filter(HourlyStat.date >= start, HourlyStat.date < end)
-            .all()
-        )
+        # Fallback to hourly_stats (only validated branches)
+        q = db.query(HourlyStat).filter(HourlyStat.date >= start, HourlyStat.date < end)
+        if valid_ids:
+            q = q.filter(HourlyStat.branch_id.in_(valid_ids))
+        stats = q.all()
         if not stats:
-            stats = db.query(HourlyStat).all()
+            q2 = db.query(HourlyStat)
+            if valid_ids:
+                q2 = q2.filter(HourlyStat.branch_id.in_(valid_ids))
+            stats = q2.all()
 
         total_visits = sum(s.total_visits for s in stats)
         wait_vals_h = [s.avg_wait_seconds / 60.0 for s in stats if s.avg_wait_seconds]
@@ -379,17 +385,23 @@ def get_overview(
             if s.avg_wait_seconds and s.avg_wait_seconds / 60.0 > 20:
                 bs["overloaded_hours"] += 1
 
-    # Build top overloaded and underloaded
-    branch_avgs: list[tuple[int, float, int]] = []
+    # Build top overloaded and underloaded with real thresholds
+    branch_avgs: list[tuple[int, float, int, float]] = []
     for bid, bs in branch_stats.items():
         avg_w = bs["wait_sum"] / bs["wait_count"] if bs["wait_count"] > 0 else 0
-        branch_avgs.append((bid, avg_w, bs["overloaded_hours"]))
+        load_pct = min(100.0, avg_w / 20.0 * 100.0) if avg_w else 0
+        branch_avgs.append((bid, avg_w, bs["overloaded_hours"], load_pct))
 
-    # Sort by avg_wait descending for overloaded
-    sorted_by_wait = sorted(branch_avgs, key=lambda x: x[1], reverse=True)
+    # Overloaded: only branches where avg wait > 20 min
+    overloaded = [
+        (bid, avg_w, oh, lp)
+        for bid, avg_w, oh, lp in branch_avgs
+        if avg_w > 20
+    ]
+    overloaded.sort(key=lambda x: x[1], reverse=True)
 
     top_overloaded = []
-    for bid, avg_w, oh in sorted_by_wait[:5]:
+    for bid, avg_w, oh, _lp in overloaded[:5]:
         branch = db.get(Branch, bid)
         top_overloaded.append(
             {
@@ -400,20 +412,23 @@ def get_overview(
             }
         )
 
-    # Sort by avg_wait ascending for underloaded
-    sorted_by_wait_asc = sorted(branch_avgs, key=lambda x: x[1])
+    # Underloaded: only branches where load < 30%
+    underloaded = [
+        (bid, avg_w, oh, lp)
+        for bid, avg_w, oh, lp in branch_avgs
+        if lp < 30
+    ]
+    underloaded.sort(key=lambda x: x[3])
+
     top_underloaded = []
-    for bid, avg_w, oh in sorted_by_wait_asc[:5]:
+    for bid, avg_w, _oh, lp in underloaded[:5]:
         branch = db.get(Branch, bid)
-        bs = branch_stats[bid]
-        # rough load percent estimate
-        load_pct = min(100.0, avg_w / 20.0 * 100.0) if avg_w else 0
         top_underloaded.append(
             {
                 "branch_id": bid,
                 "branch_name": branch.name if branch else None,
                 "predicted_avg_wait": round(avg_w, 1),
-                "avg_load_percent": round(load_pct, 1),
+                "avg_load_percent": round(lp, 1),
             }
         )
 

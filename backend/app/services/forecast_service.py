@@ -397,7 +397,7 @@ def get_window_stats(
 ) -> tuple[list[dict], str]:
     """Compute window load statistics.
 
-    If *from_date* is in the future (after today) -- use forecast data
+    If *from_date* is today or in the future -- use forecast data
     distributed across windows proportionally to their historical share.
     Otherwise use the existing historical queue_records logic.
 
@@ -408,7 +408,7 @@ def get_window_stats(
     """
     today = date.today()
 
-    if from_date > today:
+    if from_date >= today:
         windows = _get_window_stats_forecast(db, branch_id, from_date, to_date)
         return windows, "forecast"
 
@@ -416,53 +416,101 @@ def get_window_stats(
     return windows, "history"
 
 
+# Module-level cache for validation report
+_validation_cache: dict | None = None
+
+
+def _load_validation_report() -> dict:
+    """Load and cache validation_report.json, indexed by branch_id."""
+    global _validation_cache
+    if _validation_cache is not None:
+        return _validation_cache
+
+    from app.config import settings
+    import json
+
+    report_path = Path(settings.MODELS_DIR) / "validation_report.json"
+    if not report_path.exists():
+        _validation_cache = {}
+        return _validation_cache
+
+    with open(report_path) as f:
+        data = json.load(f)
+
+    _validation_cache = {}
+    for b in data.get("branches", []):
+        _validation_cache[b["branch_id"]] = b
+    return _validation_cache
+
+
+def get_valid_branch_ids() -> set[int]:
+    """Return set of branch IDs that have validated models."""
+    return set(_load_validation_report().keys())
+
+
+def _load_training_metadata() -> dict:
+    """Load training_metadata.json for trained_at timestamp."""
+    from app.config import settings
+    import json
+
+    meta_path = Path(settings.MODELS_DIR) / "training_metadata.json"
+    if not meta_path.exists():
+        return {}
+
+    with open(meta_path) as f:
+        return json.load(f)
+
+
 def get_quality_metrics(db: Session, branch_id: int) -> dict | None:
     """
     Возвращает метрики качества прогноза для филиала.
 
-    Returns:
-        Dict с wMAPE, confidence, training_days или None
+    Reads real validation metrics from validation_report.json instead of
+    hardcoded values. Returns None if branch has no trained model.
     """
-    from app.services.branch_metadata import BranchMetadataValidator
+    report = _load_validation_report()
+    branch_metrics = report.get(branch_id)
 
-    validator = BranchMetadataValidator(db)
-    metadata = validator.get_metadata(branch_id)
-
-    if not metadata:
+    if branch_metrics is None:
         return None
 
-    # Получаем количество дней данных из hourly_stats
+    wmape = branch_metrics["mape_daily"]
+    ci_coverage_pct = round(branch_metrics.get("ci_coverage", 0) * 100, 1)
+
+    # Combine CI coverage with wMAPE for honest confidence score.
+    # Pure CI coverage is misleading when Prophet widens intervals for bad models.
+    wmape_score = max(0.0, 100.0 - wmape)
+    confidence = round(0.5 * ci_coverage_pct + 0.5 * wmape_score, 1)
+
+    # Training days from DB (real data)
     days_count = (
         db.query(func.count(func.distinct(HourlyStat.date)))
         .filter(HourlyStat.branch_id == branch_id)
         .scalar()
     ) or 0
 
-    # Определяем wMAPE на основе confidence
-    # High confidence = low wMAPE, Low confidence = high wMAPE
-    confidence_level = metadata.get('confidence', 'medium')
-    wmape_map = {'high': 12.0, 'medium': 20.0, 'low': 35.0, 'unavailable': 100.0}
-    wmape = wmape_map.get(confidence_level, 25.0)
+    # trained_at from training_metadata.json
+    training_meta = _load_training_metadata()
+    last_updated = training_meta.get("trained_at", "")
 
-    # Конвертируем confidence в проценты
-    confidence_pct = {'high': 90.0, 'medium': 70.0, 'low': 50.0, 'unavailable': 0.0}
-    confidence = confidence_pct.get(confidence_level, 60.0)
-
-    # Рекомендации для low quality
+    # Recommendations based on actual wMAPE
     recommendations = None
-    if confidence_level == 'low':
+    if wmape >= 25:
         recommendations = [
-            "Используйте прогноз как ориентир, не как абсолютную истину",
+            "Используйте прогноз как ориентир, не как точное значение",
             "Проверяйте фактические данные чаще (ежедневно вместо еженедельно)",
-            "Модель улучшится после накопления 6-12 месяцев данных"
         ]
+        if wmape >= 50:
+            recommendations.append(
+                "Модель требует дополнительных данных или переобучения"
+            )
 
     return {
-        'wMAPE': wmape,
+        'wMAPE': round(wmape, 1),
         'confidence': confidence,
         'training_days': int(days_count),
-        'last_updated': metadata.get('validated_at', ''),
-        'recommendations': recommendations
+        'last_updated': last_updated,
+        'recommendations': recommendations,
     }
 
 

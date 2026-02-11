@@ -31,6 +31,7 @@ from app.services.forecast_service import (
     get_forecast_data,
     get_quality_metrics,
     get_staffing_recommendations,
+    get_valid_branch_ids,
     get_window_stats,
 )
 
@@ -114,6 +115,8 @@ def _resolve_date_range(
 
 
 def _ensure_branch(db: Session, branch_id: int) -> Branch:
+    if branch_id not in get_valid_branch_ids():
+        raise HTTPException(status_code=404, detail="Branch not found")
     branch = db.get(Branch, branch_id)
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")

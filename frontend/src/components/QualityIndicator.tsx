@@ -28,11 +28,7 @@ export function QualityIndicator({ metrics, variant = 'badge' }: QualityIndicato
   const [showDetails, setShowDetails] = useState(false);
 
   if (!metrics) {
-    return (
-      <span className="quality-badge quality-unavailable">
-        Качество недоступно
-      </span>
-    );
+    return null;
   }
 
   const quality = getQualityLevel(metrics.wMAPE);

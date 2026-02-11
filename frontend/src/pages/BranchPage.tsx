@@ -102,7 +102,7 @@ export default function BranchPage() {
           value={formatWait(branch.avg_wait_minutes)}
           color={branch.avg_wait_minutes > 20 ? '#EF4444' : undefined}
         />
-        <KpiCard title="Кол-во окон" value={String(branch.num_windows)} />
+        <KpiCard title="Кол-во окон" value={String(branch.num_windows)} subtitle="Всего уникальных в филиале" />
         <KpiCard
           title="Кол-во сотрудников"
           value={String(branch.num_employees)}
@@ -198,8 +198,6 @@ function ForecastTab({
 }
 
 function ForecastCharts({ forecast }: { forecast: ForecastResponse }) {
-  const hasLowQuality = forecast.quality_metrics && forecast.quality_metrics.wMAPE > 25;
-
   const lineData = useMemo(() => {
     const dailyMap = new Map<string, { value: number; lower: number; upper: number }>();
     for (const p of forecast.data) {
@@ -254,15 +252,11 @@ function ForecastCharts({ forecast }: { forecast: ForecastResponse }) {
 
   return (
     <div className="space-y-6">
-      {/* Quality indicator - показываем детальный для low quality */}
-      {hasLowQuality ? (
-        <QualityIndicator metrics={forecast.quality_metrics} variant="detailed" />
-      ) : (
-        forecast.quality_metrics && (
-          <QualityIndicator metrics={forecast.quality_metrics} variant="inline" />
-        )
+      {forecast.quality_metrics && (
+        <div className="flex justify-end">
+          <QualityIndicator metrics={forecast.quality_metrics} variant="badge" />
+        </div>
       )}
-
       <LineChart
         data={lineData}
         title="Прогноз обращений по дням"
@@ -516,7 +510,7 @@ function StaffingTab({
         <KpiCard
           title="Рекомендуемое ср. кол-во окон"
           value={avgRequired.toFixed(1).replace('.', ',')}
-          subtitle={`Текущее: ${avgCurrent.toFixed(1).replace('.', ',')}`}
+          subtitle={`Ср. активных сейчас: ${avgCurrent.toFixed(1).replace('.', ',')}`}
         />
         <KpiCard
           title="Часов с дефицитом"

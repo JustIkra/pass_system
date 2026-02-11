@@ -14,17 +14,26 @@ from app.schemas import (
     DateRange,
     ServiceStat,
 )
+from app.services.forecast_service import get_valid_branch_ids
 
 router = APIRouter(prefix="/api/branches", tags=["branches"])
 
 
 @router.get("", response_model=list[BranchListItem])
 def list_branches(db: Session = Depends(get_db)) -> list[dict]:
-    """Return a list of all branches with summary stats."""
-    branches = db.query(Branch).order_by(Branch.id).all()
+    """Return only branches with validated models."""
+    valid_ids = get_valid_branch_ids()
+    if not valid_ids:
+        return []
+    branches = (
+        db.query(Branch)
+        .filter(Branch.id.in_(valid_ids))
+        .order_by(Branch.id)
+        .all()
+    )
+
     result = []
     for b in branches:
-        # Get total records and date range
         stats = (
             db.query(
                 func.count(QueueRecord.id),
@@ -53,6 +62,8 @@ def list_branches(db: Session = Depends(get_db)) -> list[dict]:
 @router.get("/{branch_id}", response_model=BranchDetail)
 def get_branch(branch_id: int, db: Session = Depends(get_db)) -> dict:
     """Return detailed information about a single branch."""
+    if branch_id not in get_valid_branch_ids():
+        raise HTTPException(status_code=404, detail="Branch not found")
     branch = db.get(Branch, branch_id)
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
